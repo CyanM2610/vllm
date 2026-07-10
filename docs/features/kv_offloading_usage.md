@@ -120,6 +120,81 @@ To enable KV cache sharing between multiple vLLM instances using the same `root_
 PYTHONHASHSEED=0 vllm serve ...
 ```
 
+### CXL-Like Remote NUMA Memory
+
+The `cxl_numa` tier stores blocks in DRAM allocated on a selected NUMA node.
+It is intended for experiments that use remote NUMA memory as a CXL-like
+second tier; it does not detect or require physical CXL hardware. Data remains
+inclusive and write-through: GPU stores first reach the CPU primary tier and
+are then copied to every configured secondary tier. Promotions travel from the
+remote NUMA pool through the CPU primary tier before reaching the GPU.
+
+This tier requires Linux, `libnuma.so.1`, and a NUMA topology visible to the
+vLLM process. In containers, the process must also be allowed to set NUMA
+memory policy (commonly through `SYS_NICE`) and the target node must be present
+in `/proc/self/status` under `Mems_allowed_list`.
+
+| Key | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `type` | yes | — | Must be `cxl_numa`. |
+| `numa_node` | yes | — | Non-negative NUMA node containing the CXL-like pool. |
+| `numa_bytes_to_use` | yes | — | Positive pool capacity in bytes; rounded down to complete offloaded KV blocks. |
+| `n_load_threads` | no | `4` | Threads that prefer promotion (remote-to-primary) copies. |
+| `n_store_threads` | no | `2` | Threads that prefer cascade (primary-to-remote) copies. |
+| `prefault` | no | `true` | Touch the complete pool during startup so page faults are excluded from transfer timing. |
+| `verify_placement` | no | `true` | Query sampled pages with `numa_move_pages` and fail startup if any sample is not on `numa_node`. |
+
+Before choosing the local and remote nodes, inspect the actual GPU topology;
+do not infer locality from PCI bus numbers alone:
+
+```bash
+nvidia-smi topo -m
+cat /sys/bus/pci/devices/<gpu-pci-address>/numa_node
+numactl --hardware
+grep Mems_allowed_list /proc/self/status
+```
+
+Bind the EngineCore and worker to the GPU-local node, then configure a
+different node for `cxl_numa`. For a GPU local to node 0 and a remote pool on
+node 1:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen2.5-7B-Instruct \
+  --tensor-parallel-size 1 \
+  --max-model-len 16384 \
+  --kv-cache-memory-bytes 4294967296 \
+  --enable-prefix-caching \
+  --numa-bind \
+  --numa-bind-nodes 0 \
+  --kv-transfer-config '{
+    "kv_connector": "OffloadingConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+      "spec_name": "TieringOffloadingSpec",
+      "cpu_bytes_to_use": 2147483648,
+      "block_size": 64,
+      "eviction_policy": "lru",
+      "offload_prompt_only": true,
+      "secondary_tiers": [{
+        "type": "cxl_numa",
+        "numa_node": 1,
+        "numa_bytes_to_use": 17179869184,
+        "n_load_threads": 4,
+        "n_store_threads": 2,
+        "prefault": true,
+        "verify_placement": true
+      }]
+    }
+  }'
+```
+
+Allocation fails closed if libnuma is unavailable, the node is disallowed or
+lacks the requested free memory, or sampled pages are misplaced. Runtime
+capacity exhaustion fails only the affected secondary-tier store job and is
+reported by the CXL NUMA allocation-failure metric. When `prefault=false` and
+placement verification remains enabled, only the sampled pages are faulted at
+startup; later page-fault cost is then part of the experiment.
+
 ### P2P (Including P/D)
 
 The P2P tier (`type: "p2p"`) shares completed KV blocks between vLLM instances over RDMA via NIXL. Each instance binds a control socket on `host:port` and exchanges blocks directly with peers — no shared filesystem required.
@@ -140,6 +215,7 @@ The `backends` and `num_threads` options mirror the conditional logic used by [`
 - For single-tier (CPU-only) setups, set `cpu_bytes_to_use` larger than the aggregate GPU KV cache. Because offloading is immediate, a smaller CPU tier just mirrors what the GPU already holds and adds no hit rate.
 - `block_size`: larger offloaded blocks reduce per-block bookkeeping overhead but increase the granularity of lookups. Must be a multiple of the GPU block size.
 - FS thread counts: tune `n_read_threads` and `n_write_threads` to the parallelism your storage can sustain. Reads are latency-sensitive on the prefill path, so prefer more read threads when prefill hit rates are high.
+- CXL NUMA thread counts: promotion latency is usually more sensitive than write-through cascade latency, so start with more load than store threads. Verify the CPU primary mmap remains on the GPU-local node with `/proc/<engine-core-pid>/numa_maps`; the remote-pool placement check covers only the secondary tier.
 - Sharing `root_dir` across runs: runs with the same model, `block_size`, parallelism layout, and dtype share files under the same `<digest>` subdirectory. Changing any of these produces a new subdirectory; old ones are orphaned but harmless. Delete them to reclaim disk.
 
 ## Per-Request Selective Offload

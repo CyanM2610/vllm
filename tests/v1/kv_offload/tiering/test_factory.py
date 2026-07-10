@@ -54,6 +54,16 @@ def test_example_tier_registered():
     assert cls is ExampleSecondaryTierManager
 
 
+def test_cxl_numa_tier_registered():
+    """CXL NUMA tier is registered without allocating its remote pool."""
+    from vllm.v1.kv_offload.tiering.cxl_numa.manager import (
+        CXLNumaSecondaryTierManager,
+    )
+
+    cls = SecondaryTierFactory._registry["cxl_numa"]()
+    assert cls is CXLNumaSecondaryTierManager
+
+
 # ---------------------------------------------------------------------------
 # Normal path — create_secondary_tier
 # ---------------------------------------------------------------------------

@@ -77,3 +77,9 @@ SecondaryTierFactory.register_tier(
     "vllm.v1.kv_offload.tiering.obj.manager",
     "ObjectStoreSecondaryTierManager",
 )
+
+SecondaryTierFactory.register_tier(
+    "cxl_numa",
+    "vllm.v1.kv_offload.tiering.cxl_numa.manager",
+    "CXLNumaSecondaryTierManager",
+)
