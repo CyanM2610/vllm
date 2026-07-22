@@ -64,6 +64,16 @@ def test_cxl_numa_tier_registered():
     assert cls is CXLNumaSecondaryTierManager
 
 
+def test_cxl_memsim_tier_registered():
+    from vllm.v1.kv_offload.tiering.cxl_memsim.manager import (
+        CxlMemSimSecondaryTierManager,
+    )
+
+    cls = SecondaryTierFactory._registry["cxl_memsim"]()
+
+    assert cls is CxlMemSimSecondaryTierManager
+
+
 # ---------------------------------------------------------------------------
 # Normal path — create_secondary_tier
 # ---------------------------------------------------------------------------

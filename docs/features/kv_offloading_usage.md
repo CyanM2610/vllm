@@ -195,6 +195,33 @@ reported by the CXL NUMA allocation-failure metric. When `prefault=false` and
 placement verification remains enabled, only the sampled pages are faulted at
 startup; later page-fault cost is then part of the experiment.
 
+### CXLMemSim CXL Memory
+
+The `cxl_memsim` tier connects to an externally managed CXLMemSim `bulk-shm`
+server. Unlike `cxl_numa`, it explicitly models direction-specific CXL latency
+and bandwidth contention and counts every touched 64-byte cache line. The data
+plane still uses one bulk host copy per KV block, so software IPC overhead is
+not multiplied by the logical cache-line count.
+
+| Key | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `type` | yes | — | Must be `cxl_memsim`. |
+| `client_library` | yes | — | Absolute path to `libcxlmemsim_client.so`. |
+| `control_shm_name` | yes | — | Control object published by `--bulk-shm-name`. |
+| `cxl_bytes_to_use` | yes | — | Tier capacity in bytes, rounded down to complete KV blocks. |
+| `cxl_offset_bytes` | no | `0` | Start of this tier's range in the server mapping. |
+| `n_load_threads` | no | `4` | Threads that prefer promotion reads. |
+| `n_store_threads` | no | `2` | Threads that prefer cascade writes. |
+| `request_timeout_ms` | no | `30000` | Native request and connection timeout. |
+
+The server must be started before vLLM. Startup fails if the shared-memory ABI
+is incompatible or the configured offset and capacity exceed the published
+mapping. See
+[CXLMemSim KV Offloading Experiments](../../benchmarks/kv_offload/CXL_MEMSIM_EXPERIMENTS.md)
+for complete build, server, connector, and acceptance-test commands.
+Separate vLLM processes sharing one simulator must use non-overlapping
+`cxl_offset_bytes` ranges.
+
 ### P2P (Including P/D)
 
 The P2P tier (`type: "p2p"`) shares completed KV blocks between vLLM instances over RDMA via NIXL. Each instance binds a control socket on `host:port` and exchanges blocks directly with peers — no shared filesystem required.

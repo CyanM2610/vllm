@@ -83,3 +83,9 @@ SecondaryTierFactory.register_tier(
     "vllm.v1.kv_offload.tiering.cxl_numa.manager",
     "CXLNumaSecondaryTierManager",
 )
+
+SecondaryTierFactory.register_tier(
+    "cxl_memsim",
+    "vllm.v1.kv_offload.tiering.cxl_memsim.manager",
+    "CxlMemSimSecondaryTierManager",
+)
