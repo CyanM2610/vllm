@@ -1408,6 +1408,13 @@ def get_kv_cache_config_from_groups(
             prefix_cache_retention_interval=(
                 vllm_config.cache_config.prefix_cache_retention_interval
             ),
+            prefix_cache_eviction_policy=(
+                vllm_config.cache_config.prefix_cache_eviction_policy
+            ),
+            hotprefix_aging_interval=(
+                vllm_config.cache_config.hotprefix_aging_interval
+            ),
+            hotprefix_num_buckets=vllm_config.cache_config.hotprefix_num_buckets,
         )
 
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
@@ -1472,6 +1479,11 @@ def get_kv_cache_config_from_groups(
         prefix_cache_retention_interval=(
             vllm_config.cache_config.prefix_cache_retention_interval
         ),
+        prefix_cache_eviction_policy=(
+            vllm_config.cache_config.prefix_cache_eviction_policy
+        ),
+        hotprefix_aging_interval=vllm_config.cache_config.hotprefix_aging_interval,
+        hotprefix_num_buckets=vllm_config.cache_config.hotprefix_num_buckets,
     )
 
 

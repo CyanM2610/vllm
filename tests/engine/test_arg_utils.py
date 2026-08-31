@@ -488,6 +488,27 @@ def test_prefix_cache_default():
     assert engine_args.prefix_cache_retention_interval == 64
 
 
+def test_hotprefix_cli_options(monkeypatch):
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--prefix-cache-eviction-policy",
+            "hotprefix",
+            "--hotprefix-aging-interval",
+            "17",
+            "--hotprefix-num-buckets",
+            "32",
+        ]
+    )
+
+    assert args.prefix_cache_eviction_policy == "hotprefix"
+    assert args.hotprefix_aging_interval == 17
+    assert args.hotprefix_num_buckets == 32
+
+
 def test_prefix_cache_retention_interval_from_deprecated_env(
     monkeypatch, caplog, disable_log_dedup
 ):

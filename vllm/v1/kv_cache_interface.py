@@ -1222,6 +1222,12 @@ class KVCacheConfig:
     """
     prefix_cache_retention_interval: int | None = None
     """Resolved retention policy for local prefix-cache checkpoints."""
+    prefix_cache_eviction_policy: str = "lru"
+    """Resolved physical HBM prefix-cache eviction policy."""
+    hotprefix_aging_interval: int = 50
+    """Initial request lookups between HotPrefix clock aging passes."""
+    hotprefix_num_buckets: int = 16384
+    """Bucket count for the HotPrefix cuckoo metadata store."""
     kv_cache_layout: str | None = None
     """The KV cache layout resolved by the engine core, adopted by all workers."""
 

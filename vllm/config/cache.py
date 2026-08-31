@@ -69,6 +69,7 @@ def _get_prefix_cache_retention_interval() -> int | None:
 MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
+PrefixCacheEvictionMode = Literal["lru", "hotprefix"]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
 
@@ -137,6 +138,12 @@ class CacheConfig:
     `ModelConfig` and that value should be manually duplicated here."""
     enable_prefix_caching: bool = True
     """Whether to enable prefix caching."""
+    prefix_cache_eviction_policy: PrefixCacheEvictionMode = "lru"
+    """Physical HBM prefix-cache eviction policy."""
+    hotprefix_aging_interval: int = Field(default=50, gt=0)
+    """Initial request lookups between HotPrefix clock aging passes."""
+    hotprefix_num_buckets: int = Field(default=16384, gt=0)
+    """Power-of-two bucket count for the HotPrefix cuckoo metadata store."""
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:
 
@@ -268,6 +275,9 @@ class CacheConfig:
             "is_attention_free",
             "num_gpu_blocks_override",
             "enable_prefix_caching",
+            "prefix_cache_eviction_policy",
+            "hotprefix_aging_interval",
+            "hotprefix_num_buckets",
             "prefix_caching_hash_algo",
             "prefix_cache_retention_interval",
             # Prefix-caching implementation detail (doesn't affect compiled graph).

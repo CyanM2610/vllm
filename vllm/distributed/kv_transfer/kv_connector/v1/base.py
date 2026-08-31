@@ -63,7 +63,7 @@ if TYPE_CHECKING:
     )
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.block_pool import BlockPool
-    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
@@ -444,6 +444,25 @@ class KVConnectorBase_V1(ABC):
         Args:
             gpu_block_pool: the GPU block pool.
         """
+        return
+
+    def plan_background_transfers(
+        self,
+        scheduler_output: SchedulerOutput,
+        kv_cache_manager: "KVCacheManager",
+        *,
+        has_decode_work: bool,
+    ) -> None:
+        """Plan connector-owned transfers during non-blocking model execution.
+
+        The default is deliberately inert. Connectors may perform CPU control
+        work here, but must not mutate the current ``scheduler_output``; any
+        resulting transfer metadata is consumed by a later scheduler step.
+        """
+        return
+
+    def set_background_transfer_context(self, *, has_decode_work: bool) -> None:
+        """Publish whether the step may carry connector background traffic."""
         return
 
     @abstractmethod

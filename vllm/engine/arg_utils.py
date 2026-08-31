@@ -72,6 +72,7 @@ from vllm.config.cache import (
     KVOffloadingBackend,
     MambaCacheMode,
     MambaDType,
+    PrefixCacheEvictionMode,
     PrefixCachingHashAlgo,
 )
 from vllm.config.device import Device
@@ -524,6 +525,11 @@ class EngineArgs:
     )
     block_size: int | None = None
     enable_prefix_caching: bool | None = None
+    prefix_cache_eviction_policy: PrefixCacheEvictionMode = (
+        CacheConfig.prefix_cache_eviction_policy
+    )
+    hotprefix_aging_interval: int = CacheConfig.hotprefix_aging_interval
+    hotprefix_num_buckets: int = CacheConfig.hotprefix_num_buckets
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
@@ -1245,6 +1251,18 @@ class EngineArgs:
                 **cache_kwargs["enable_prefix_caching"],
                 "default": None,
             },
+        )
+        cache_group.add_argument(
+            "--prefix-cache-eviction-policy",
+            **cache_kwargs["prefix_cache_eviction_policy"],
+        )
+        cache_group.add_argument(
+            "--hotprefix-aging-interval",
+            **cache_kwargs["hotprefix_aging_interval"],
+        )
+        cache_group.add_argument(
+            "--hotprefix-num-buckets",
+            **cache_kwargs["hotprefix_num_buckets"],
         )
         cache_group.add_argument(
             "--prefix-caching-hash-algo", **cache_kwargs["prefix_caching_hash_algo"]
@@ -2042,6 +2060,9 @@ class EngineArgs:
             num_gpu_blocks_override=self.num_gpu_blocks_override,
             sliding_window=sliding_window,
             enable_prefix_caching=self.enable_prefix_caching,
+            prefix_cache_eviction_policy=self.prefix_cache_eviction_policy,
+            hotprefix_aging_interval=self.hotprefix_aging_interval,
+            hotprefix_num_buckets=self.hotprefix_num_buckets,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             prefix_cache_retention_interval=self.prefix_cache_retention_interval,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,

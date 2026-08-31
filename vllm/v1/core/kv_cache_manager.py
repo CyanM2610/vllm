@@ -9,6 +9,19 @@ from typing import Literal, overload
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.hotprefix import (
+    CuckooHotnessStore,
+    EvictionGroup,
+    EvictionNode,
+    EvictionStoreCandidate,
+    HotPrefixBlockEvictionSelector,
+    HotPrefixEvictionDeferred,
+    HotPrefixNodeSnapshot,
+    LocalHotPrefixTree,
+    PromotionManager,
+    PromotionState,
+    PromotionTransaction,
+)
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     get_kv_cache_coordinator,
@@ -132,6 +145,7 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
+        hotprefix_namespace: bytes = b"vllm-local",
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -167,6 +181,33 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+        self.hotprefix_tree: LocalHotPrefixTree | None = None
+        self.hotprefix_trees: dict[str, LocalHotPrefixTree] = {}
+        self._hotprefix_hotness_store: CuckooHotnessStore | None = None
+        self._hotprefix_namespace = hotprefix_namespace
+        self._hotprefix_aging_interval = kv_cache_config.hotprefix_aging_interval
+        self._hotprefix_reserved_stores: set[bytes] = set()
+        self._hotprefix_observed_request_ids: set[str] = set()
+        self.hotprefix_eviction_selector: HotPrefixBlockEvictionSelector | None = None
+        self.hotprefix_promotion_manager: PromotionManager | None = None
+        self._hotprefix_block_size = scheduler_block_size
+        self.hotprefix_hash_block_size = hash_block_size
+        if kv_cache_config.prefix_cache_eviction_policy == "hotprefix":
+            if not enable_caching:
+                raise ValueError("hotprefix eviction requires prefix caching")
+            if len(kv_cache_config.kv_cache_groups) != 1:
+                raise ValueError("hotprefix currently requires one KV cache group")
+            self._hotprefix_hotness_store = CuckooHotnessStore(
+                num_buckets=kv_cache_config.hotprefix_num_buckets
+            )
+            self.hotprefix_tree = self.get_hotprefix_tree("")
+            self.hotprefix_eviction_selector = HotPrefixBlockEvictionSelector()
+            self.hotprefix_promotion_manager = PromotionManager(max_inflight=1)
+            self.block_pool.eviction_selector = self.hotprefix_eviction_selector
+        elif kv_cache_config.prefix_cache_eviction_policy != "lru":
+            raise ValueError(
+                "prefix_cache_eviction_policy must be 'lru' or 'hotprefix'"
+            )
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -188,6 +229,11 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+
+    @property
+    def hotprefix_block_size(self) -> int:
+        """Return the physical scheduler block size used by HotPrefix."""
+        return self._hotprefix_block_size
 
     @property
     def usage(self) -> float:
@@ -291,6 +337,27 @@ class KVCacheManager:
         )
 
         blocks = self.create_kv_cache_blocks(computed_blocks)
+        hotprefix_tree = self.get_hotprefix_tree(request.cache_salt)
+        if (
+            hotprefix_tree is not None
+            and request.request_id not in self._hotprefix_observed_request_ids
+        ):
+            aging_epoch = hotprefix_tree.aging_epoch
+            hotprefix_tree.record_match(
+                request.all_token_ids,
+                matched_tokens=num_new_computed_tokens,
+            )
+            if (
+                hotprefix_tree.aging_epoch != aging_epoch
+                and self.hotprefix_eviction_selector is not None
+            ):
+                self.hotprefix_eviction_selector.age_all()
+            self._update_hotprefix_priorities(
+                request.all_token_ids,
+                computed_blocks,
+                tree=hotprefix_tree,
+            )
+            self._hotprefix_observed_request_ids.add(request.request_id)
         return blocks, num_new_computed_tokens, shared_prefix_boundary
 
     def get_computed_blocks_for_connector(
@@ -525,6 +592,11 @@ class KVCacheManager:
             # Cannot allocate new blocks
             return None
 
+        try:
+            self.block_pool.ensure_allocation_ready(num_blocks_to_allocate)
+        except HotPrefixEvictionDeferred:
+            return None
+
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
             or num_external_computed_tokens > 0
@@ -538,12 +610,15 @@ class KVCacheManager:
                 num_external_computed_tokens=num_external_computed_tokens,
             )
 
-        new_blocks = self.coordinator.allocate_new_blocks(
-            request.request_id,
-            num_tokens_need_slot,
-            num_tokens_main_model,
-            num_encoder_tokens,
-        )
+        try:
+            new_blocks = self.coordinator.allocate_new_blocks(
+                request.request_id,
+                num_tokens_need_slot,
+                num_tokens_main_model,
+                num_encoder_tokens,
+            )
+        except HotPrefixEvictionDeferred:
+            return None
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
@@ -559,7 +634,7 @@ class KVCacheManager:
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
         )
-        self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        self.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
 
@@ -572,6 +647,8 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         self.coordinator.free(request.request_id)
+        if request.is_finished():
+            self._hotprefix_observed_request_ids.discard(request.request_id)
 
     def remove_skipped_blocks(
         self,
@@ -624,6 +701,7 @@ class KVCacheManager:
         """
         if not self.block_pool.reset_prefix_cache():
             return False
+        self._hotprefix_observed_request_ids.clear()
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.reset = True
@@ -756,6 +834,322 @@ class KVCacheManager:
         """
         if self.enable_caching:
             self.coordinator.cache_blocks(request, num_computed_tokens)
+            self._publish_hotprefix_blocks(request, num_computed_tokens)
+
+    def _publish_hotprefix_blocks(
+        self, request: Request, num_computed_tokens: int
+    ) -> None:
+        hotprefix_tree = self.get_hotprefix_tree(request.cache_salt)
+        if hotprefix_tree is None:
+            return
+        cached_tokens = min(
+            num_computed_tokens,
+            self.estimate_cached_tokens(request),
+        )
+        token_ids = request.all_token_ids[:cached_tokens]
+        if not token_ids:
+            return
+        hotprefix_tree.publish(token_ids)
+        self._update_hotprefix_priorities(
+            token_ids,
+            self.coordinator.get_blocks(request.request_id),
+            tree=hotprefix_tree,
+        )
+
+    def _update_hotprefix_priorities(
+        self,
+        token_ids: Sequence[int],
+        blocks: tuple[list[KVCacheBlock], ...],
+        *,
+        tree: LocalHotPrefixTree,
+    ) -> None:
+        selector = self.hotprefix_eviction_selector
+        if selector is None or not blocks:
+            return
+        request_tokens = tuple(token_ids)
+        path = [
+            node
+            for node in tree.snapshot()
+            if node.valid
+            if len(node.full_prefix) <= len(request_tokens)
+            and request_tokens[: len(node.full_prefix)] == node.full_prefix
+        ]
+        groups = []
+        for node in path:
+            node_end = len(node.full_prefix)
+            node_start = node_end - len(node.segment)
+            block_ids = tuple(
+                block.block_id
+                for block_index, block in enumerate(blocks[0])
+                if not block.is_null
+                and block_index * self._hotprefix_block_size < node_end
+                and (block_index + 1) * self._hotprefix_block_size > node_start
+            )
+            if block_ids:
+                groups.append(
+                    EvictionGroup(
+                        (
+                            EvictionNode(
+                                node.prefix_id,
+                                node.record.frequency,
+                                node.record.clock,
+                                tree.namespace,
+                                node.full_prefix,
+                                tuple(
+                                    block.block_id
+                                    for block in blocks[0][
+                                        : cdiv(
+                                            len(node.full_prefix),
+                                            self._hotprefix_block_size,
+                                        )
+                                    ]
+                                    if not block.is_null
+                                ),
+                            ),
+                        ),
+                        block_ids,
+                        self._hotprefix_block_size,
+                    )
+                )
+        selector.update_groups(groups)
+
+    def reserve_hotprefix_eviction_store(
+        self,
+        *,
+        transfer_chunk_tokens: int,
+        min_free_blocks: int = 1,
+    ) -> EvictionStoreCandidate | None:
+        """Pin one cold, chunk-aligned full prefix for selective Host admission.
+
+        This runs after foreground scheduling. It never consumes the requested
+        free-block headroom and leaves native APC hashes live until STORE reaches
+        a terminal state.
+        """
+        selector = self.hotprefix_eviction_selector
+        if selector is None:
+            return None
+        if transfer_chunk_tokens <= 0 or min_free_blocks < 0:
+            raise ValueError("invalid HotPrefix eviction reservation limits")
+        free_ids = {
+            block.block_id
+            for block in self.block_pool.free_block_queue.get_all_free_blocks()
+        }
+        page_size_bytes = self.kv_cache_config.kv_cache_groups[
+            0
+        ].kv_cache_spec.page_size_bytes
+        for group in selector.deferred_groups():
+            nodes = sorted(
+                (
+                    node
+                    for node in group.nodes
+                    if node.full_prefix
+                    and node.full_block_ids
+                    and len(node.full_prefix) % transfer_chunk_tokens == 0
+                    and node.prefix_id not in self._hotprefix_reserved_stores
+                ),
+                key=lambda node: (-len(node.full_prefix), node.prefix_id),
+            )
+            for node in nodes:
+                source_ids = node.full_block_ids
+                source_free_ids = set(source_ids) & free_ids
+                if len(free_ids) - len(source_free_ids) < min_free_blocks:
+                    continue
+                source_blocks = [
+                    self.block_pool.blocks[block_id] for block_id in source_ids
+                ]
+                if any(block.block_hash is None for block in source_blocks):
+                    continue
+                self.block_pool.touch(source_blocks)
+                self._hotprefix_reserved_stores.add(node.prefix_id)
+                selector.mark_group_pending(group.block_ids)
+                return EvictionStoreCandidate(
+                    node.namespace,
+                    node.prefix_id,
+                    node.full_prefix,
+                    source_ids,
+                    group.block_ids,
+                    len(source_ids) * page_size_bytes,
+                    node.frequency,
+                    node.clock,
+                )
+        return None
+
+    def release_hotprefix_eviction_store(
+        self, candidate: EvictionStoreCandidate
+    ) -> None:
+        """Release the source pin after DEDUP, rejection, publish, or failure."""
+        if candidate.prefix_id not in self._hotprefix_reserved_stores:
+            raise RuntimeError("HotPrefix eviction STORE source is not reserved")
+        self._hotprefix_reserved_stores.remove(candidate.prefix_id)
+        selector = self.hotprefix_eviction_selector
+        if selector is None:
+            raise RuntimeError("HotPrefix eviction selector disappeared")
+        selector.mark_group_terminal(candidate.eviction_group_block_ids)
+        self.block_pool.free_blocks(
+            [self.block_pool.blocks[block_id] for block_id in candidate.block_ids]
+        )
+
+    def reserve_hotprefix_promotion(
+        self,
+        *,
+        prefix_id: bytes,
+        token_ids: Sequence[int],
+        total_bytes: int,
+        min_free_blocks: int = 1,
+    ) -> PromotionTransaction | None:
+        """Reserve detached HBM target blocks after foreground scheduling."""
+        manager = self.hotprefix_promotion_manager
+        if manager is None:
+            return None
+        num_blocks = cdiv(len(token_ids), self._hotprefix_block_size)
+        if len(token_ids) % self._hotprefix_block_size != 0:
+            return None
+        page_size_bytes = self.kv_cache_config.kv_cache_groups[
+            0
+        ].kv_cache_spec.page_size_bytes
+        if total_bytes != num_blocks * page_size_bytes:
+            return None
+        if self.block_pool.get_num_free_blocks() - num_blocks < min_free_blocks:
+            return None
+        if manager.get(prefix_id) is not None:
+            return None
+        try:
+            target_blocks = self.block_pool.get_new_blocks(num_blocks)
+        except HotPrefixEvictionDeferred:
+            return None
+        return manager.start(
+            prefix_id=prefix_id,
+            total_bytes=total_bytes,
+            target_block_ids=tuple(block.block_id for block in target_blocks),
+        )
+
+    def publish_hotprefix_promotion(
+        self,
+        request: Request,
+        prefix_id: bytes,
+    ) -> tuple[str, ...]:
+        """Atomically publish a completed detached promotion into native APC."""
+        manager = self.hotprefix_promotion_manager
+        if manager is None:
+            raise RuntimeError("HotPrefix promotion is disabled")
+        transaction = manager.get(prefix_id)
+        if transaction is None or transaction.state is not PromotionState.READY:
+            raise RuntimeError("HotPrefix promotion copy is not complete")
+        blocks = [
+            self.block_pool.blocks[block_id]
+            for block_id in transaction.target_block_ids
+        ]
+        tree = self.get_hotprefix_tree(request.cache_salt)
+        if tree is None:
+            raise RuntimeError("HotPrefix local tree disappeared")
+        token_ids = request.all_token_ids[: len(blocks) * self._hotprefix_block_size]
+        node_by_id = {node.prefix_id: node for node in tree.snapshot()}
+        node = node_by_id.get(prefix_id)
+        if node is None or node.full_prefix != tuple(token_ids):
+            raise RuntimeError("promotion prefix no longer matches Local tree")
+        self.block_pool.cache_full_blocks(
+            request,
+            blocks,
+            num_cached_blocks=0,
+            num_full_blocks=len(blocks),
+            block_size=self._hotprefix_block_size,
+            kv_cache_group_id=0,
+        )
+        tree.publish(token_ids)
+        self._update_hotprefix_priorities(
+            token_ids,
+            (blocks,),
+            tree=tree,
+        )
+        self.block_pool.free_blocks(blocks)
+        waiters = manager.take_waiters(prefix_id)
+        manager.retire(prefix_id)
+        return waiters
+
+    def advance_hotprefix_promotion(
+        self, prefix_id: bytes, *, copied_bytes: int
+    ) -> bool:
+        """Account one completed transfer chunk without partial publication."""
+        manager = self.hotprefix_promotion_manager
+        if manager is None:
+            raise RuntimeError("HotPrefix promotion is disabled")
+        manager.advance(prefix_id, budget_bytes=copied_bytes)
+        transaction = manager.get(prefix_id)
+        assert transaction is not None
+        return transaction.state is PromotionState.READY
+
+    def fail_hotprefix_promotion(self, prefix_id: bytes) -> tuple[str, ...]:
+        """Release unpublished target blocks after a failed Host retrieve."""
+        manager = self.hotprefix_promotion_manager
+        if manager is None:
+            raise RuntimeError("HotPrefix promotion is disabled")
+        transaction = manager.get(prefix_id)
+        if transaction is None:
+            return ()
+        manager.fail(prefix_id)
+        self.block_pool.evict_blocks(set(transaction.target_block_ids))
+        self.block_pool.free_blocks(
+            [
+                self.block_pool.blocks[block_id]
+                for block_id in transaction.target_block_ids
+            ]
+        )
+        waiters = manager.take_waiters(prefix_id)
+        manager.retire(prefix_id)
+        return waiters
+
+    def get_hotprefix_tree(
+        self, cache_salt: str | None = None
+    ) -> LocalHotPrefixTree | None:
+        """Return the Local tree for one vLLM cache namespace.
+
+        vLLM cache salts are correctness boundaries.  Trees share the bounded
+        hotness store but never share radix topology or prefix identities, and
+        the namespace byte string matches LMCache's ``model\0cache_salt`` key.
+        """
+        store = self._hotprefix_hotness_store
+        if store is None:
+            return None
+        salt = cache_salt or ""
+        tree = self.hotprefix_trees.get(salt)
+        if tree is None:
+            tree = LocalHotPrefixTree(
+                hotness_store=store,
+                namespace=self._hotprefix_namespace + salt.encode(),
+                aging_interval=self._hotprefix_aging_interval,
+            )
+            self.hotprefix_trees[salt] = tree
+        return tree
+
+    def get_hotprefix_promotion_nodes(
+        self,
+    ) -> tuple[tuple[bytes, tuple[HotPrefixNodeSnapshot, ...]], ...]:
+        """Return locally hot logical nodes that are currently absent from HBM."""
+        selector = self.hotprefix_eviction_selector
+        if selector is None:
+            return ()
+        resident = selector.resident_prefix_ids()
+        by_namespace: list[tuple[bytes, tuple[HotPrefixNodeSnapshot, ...]]] = []
+        for tree in self.hotprefix_trees.values():
+            missing = tuple(
+                sorted(
+                    (
+                        node
+                        for node in tree.snapshot()
+                        if node.valid and node.prefix_id not in resident
+                    ),
+                    key=lambda node: (
+                        -(
+                            node.record.frequency
+                            + node.record.clock / max(1, len(node.segment))
+                        ),
+                        node.prefix_id,
+                    ),
+                )
+            )
+            if missing:
+                by_namespace.append((tree.namespace, missing))
+        return tuple(sorted(by_namespace, key=lambda item: item[0]))
 
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]

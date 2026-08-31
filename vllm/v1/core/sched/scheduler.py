@@ -35,6 +35,7 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
 )
+from vllm.v1.core.hotprefix import make_hotprefix_namespace
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -284,6 +285,17 @@ class Scheduler(SchedulerInterface):
         if hash_block_size is None:
             hash_block_size = block_size
         self.hash_block_size = hash_block_size
+        hotprefix_namespace = make_hotprefix_namespace(
+            model=vllm_config.model_config.model,
+            revision=(
+                vllm_config.model_config.revision
+                or getattr(vllm_config.model_config.hf_config, "_commit_hash", None)
+            ),
+            kv_layout=kv_cache_config.kv_cache_layout,
+            group_specs=tuple(
+                repr(group.kv_cache_spec) for group in kv_cache_config.kv_cache_groups
+            ),
+        )
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -299,6 +311,7 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
+            hotprefix_namespace=hotprefix_namespace,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -1361,6 +1374,9 @@ class Scheduler(SchedulerInterface):
         # 2. Wrap up all the KV cache load / save ops into an opaque object
         # 3. Clear the internal states of the connector
         if self.connector is not None:
+            self.connector.set_background_transfer_context(
+                has_decode_work=self._has_decode_work(scheduler_output)
+            )
             meta = self._build_kv_connector_meta(self.connector, scheduler_output)
             scheduler_output.kv_connector_metadata = meta
 
@@ -1387,6 +1403,25 @@ class Scheduler(SchedulerInterface):
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
+
+    def plan_background_transfers(self, scheduler_output: SchedulerOutput) -> None:
+        """Let the connector plan next-step work while the GPU is executing."""
+        connector = self.connector
+        if connector is None:
+            return
+        connector.plan_background_transfers(
+            scheduler_output,
+            self.kv_cache_manager,
+            has_decode_work=self._has_decode_work(scheduler_output),
+        )
+
+    def _has_decode_work(self, scheduler_output: SchedulerOutput) -> bool:
+        return any(
+            request_id in self.requests
+            and self.requests[request_id].num_computed_tokens
+            >= self.requests[request_id].num_prompt_tokens
+            for request_id in scheduler_output.num_scheduled_tokens
+        )
 
     def _get_new_block_ids_to_zero(self) -> list[int] | None:
         # Drain new attention block ids every step so the manager-side list

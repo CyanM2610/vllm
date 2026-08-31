@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
-from typing import Any
+from typing import Any, Protocol
 
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
@@ -28,6 +28,18 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+class PrefixCacheEvictionSelector(Protocol):
+    """Select cached, ref-free blocks for physical HBM reclamation."""
+
+    def select_blocks(
+        self,
+        candidates: tuple[KVCacheBlock, ...],
+        num_blocks: int,
+    ) -> tuple[int, ...]:
+        """Return exactly ``num_blocks`` candidate block IDs."""
+        ...
 
 
 class BlockHashToBlockMap:
@@ -157,6 +169,8 @@ class BlockPool:
             actual block size can be a multiple of hash_block_size.
         enable_kv_cache_events: Whether to enable kv cache events.
         metrics_collector: Optional metrics collector for tracking block residency.
+        eviction_selector: Optional policy for cached blocks in the free queue.
+            Blocks without prefix-cache metadata always retain allocation priority.
     """
 
     def __init__(
@@ -166,6 +180,7 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        eviction_selector: PrefixCacheEvictionSelector | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -194,6 +209,7 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        self.eviction_selector = eviction_selector
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -658,7 +674,17 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        ret = self._select_free_blocks(num_blocks)
+
+        # Selecting one physical block can invalidate a whole token-level
+        # HotPrefix node (or a connected group of boundary-sharing nodes).
+        # Remove collateral APC hashes now; the blocks remain in the free queue
+        # and are not allocated unless requested by a later call.
+        collateral_fn = getattr(self.eviction_selector, "collateral_block_ids", None)
+        if collateral_fn is not None:
+            selected_ids = tuple(block.block_id for block in ret)
+            for block_id in collateral_fn(selected_ids):
+                self._maybe_evict_cached_block(self.blocks[block_id])
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -675,6 +701,70 @@ class BlockPool:
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         return ret
+
+    def ensure_allocation_ready(self, num_blocks: int) -> None:
+        """Fail before coordinator mutation when cached victims need admission."""
+        if self.eviction_selector is None:
+            return
+        free_blocks = self.free_block_queue.get_all_free_blocks()
+        uncached_count = sum(
+            block.block_hash is None
+            and block.block_id not in self.cached_block_hashes_by_block
+            for block in free_blocks
+        )
+        remaining = max(0, num_blocks - uncached_count)
+        if remaining == 0:
+            return
+        candidates = tuple(
+            block
+            for block in free_blocks
+            if block.block_hash is not None
+            or block.block_id in self.cached_block_hashes_by_block
+        )
+        self.eviction_selector.select_blocks(candidates, remaining)
+
+    def _select_free_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+        if self.eviction_selector is None:
+            return self.free_block_queue.popleft_n(num_blocks)
+
+        free_blocks = self.free_block_queue.get_all_free_blocks()
+        uncached = [
+            block
+            for block in free_blocks
+            if block.block_hash is None
+            and block.block_id not in self.cached_block_hashes_by_block
+        ]
+        selected = uncached[:num_blocks]
+        for block in selected:
+            self.free_block_queue.remove(block)
+        remaining = num_blocks - len(selected)
+        if remaining == 0:
+            return selected
+
+        selected_ids = {block.block_id for block in selected}
+        candidates = tuple(
+            block for block in free_blocks if block.block_id not in selected_ids
+        )
+        try:
+            chosen_ids = self.eviction_selector.select_blocks(candidates, remaining)
+            if len(chosen_ids) != remaining or len(set(chosen_ids)) != remaining:
+                raise ValueError(
+                    "eviction selector must return the requested number "
+                    "of unique blocks"
+                )
+            by_id = {block.block_id: block for block in candidates}
+            chosen = [by_id[block_id] for block_id in chosen_ids]
+        except Exception as error:
+            self.free_block_queue.prepend_n(selected)
+            if isinstance(error, KeyError):
+                raise ValueError(
+                    "eviction selector returned a block outside the free queue"
+                ) from error
+            raise
+        for block in chosen:
+            self.free_block_queue.remove(block)
+        selected.extend(chosen)
+        return selected
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """
@@ -697,6 +787,9 @@ class BlockPool:
             return False
 
         self._emit_block_removed_events(evicted_hashes)
+        discard_fn = getattr(self.eviction_selector, "discard", None)
+        if discard_fn is not None:
+            discard_fn((block.block_id,))
         return True
 
     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
