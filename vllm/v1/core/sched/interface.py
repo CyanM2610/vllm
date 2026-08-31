@@ -255,6 +255,10 @@ class SchedulerInterface(ABC):
     def get_kv_connector(self) -> "KVConnectorBase_V1 | None":
         return None
 
+    def plan_background_transfers(self, scheduler_output: "SchedulerOutput") -> None:
+        """Use the model-execution overlap window for connector control work."""
+        return
+
     def get_ec_connector(self) -> "ECConnectorBase | None":
         return None
 
