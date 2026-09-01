@@ -301,6 +301,53 @@ def test_kv_cache_manager_enables_hotprefix_without_changing_default_lru() -> No
     assert lru.block_pool.eviction_selector is None
 
 
+def test_hotprefix_promotion_keeps_one_transfer_worth_of_decode_headroom() -> None:
+    group = KVCacheGroupSpec(
+        ["layer"],
+        FullAttentionSpec(
+            block_size=4,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+        ),
+    )
+    manager = KVCacheManager(
+        KVCacheConfig(
+            num_blocks=6,
+            kv_cache_tensors=[],
+            kv_cache_groups=[group],
+            prefix_cache_eviction_policy="hotprefix",
+            hotprefix_num_buckets=8,
+        ),
+        max_model_len=32,
+        scheduler_block_size=4,
+        hash_block_size=4,
+    )
+    occupied = manager.block_pool.get_new_blocks(3)
+    page_size = group.kv_cache_spec.page_size_bytes
+
+    assert (
+        manager.reserve_hotprefix_promotion(
+            prefix_id=b"starvation-guard",
+            token_ids=range(8),
+            total_bytes=2 * page_size,
+            min_free_blocks=0,
+        )
+        is None
+    )
+
+    manager.block_pool.free_blocks(occupied)
+    assert (
+        manager.reserve_hotprefix_promotion(
+            prefix_id=b"starvation-guard",
+            token_ids=range(8),
+            total_bytes=2 * page_size,
+            min_free_blocks=0,
+        )
+        is not None
+    )
+
+
 def test_local_hotprefix_namespaces_match_lmcache_and_isolate_cache_salts() -> None:
     group = KVCacheGroupSpec(
         ["layer"],
