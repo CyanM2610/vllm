@@ -997,7 +997,13 @@ class KVCacheManager:
         total_bytes: int,
         min_free_blocks: int = 1,
     ) -> PromotionTransaction | None:
-        """Reserve detached HBM target blocks after foreground scheduling."""
+        """Reserve detached HBM target blocks after foreground scheduling.
+
+        Keep at least one additional promotion-sized region free. A single
+        watermark block covers only the next decode allocation; a long-running
+        request can otherwise be preempted indefinitely while background
+        promotions repeatedly occupy nearly all remaining HBM.
+        """
         manager = self.hotprefix_promotion_manager
         if manager is None:
             return None
@@ -1009,7 +1015,8 @@ class KVCacheManager:
         ].kv_cache_spec.page_size_bytes
         if total_bytes != num_blocks * page_size_bytes:
             return None
-        if self.block_pool.get_num_free_blocks() - num_blocks < min_free_blocks:
+        decode_headroom = max(min_free_blocks, num_blocks)
+        if self.block_pool.get_num_free_blocks() - num_blocks < decode_headroom:
             return None
         if manager.get(prefix_id) is not None:
             return None

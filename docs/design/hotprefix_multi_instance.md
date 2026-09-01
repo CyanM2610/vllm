@@ -56,4 +56,7 @@ The complete logical prefix is sliced into LMCache-aligned ranges bounded by
 `lmcache.mp.hotprefix_promotion_budget_bytes`; at least one transfer chunk is
 allowed as the starvation quantum. Chunks advance only on steps carrying decode
 work, while all target blocks and the renewable source ticket remain reserved.
-Only the final successful chunk publishes native APC hashes.
+Admission also leaves at least one additional promotion-sized region free for
+foreground decode growth; when that conservative HBM headroom is unavailable,
+background promotion pauses instead of repeatedly preempting the foreground
+request. Only the final successful chunk publishes native APC hashes.
