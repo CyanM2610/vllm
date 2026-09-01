@@ -1230,6 +1230,8 @@ class KVCacheConfig:
     """Bucket count for the HotPrefix cuckoo metadata store."""
     hotprefix_experiment_preset: str | None = None
     """Resolved experiment-only HotPrefix cost-ablation preset."""
+    hotprefix_observability_mode: str = "off"
+    """Resolved HotPrefix-only observation mode."""
     kv_cache_layout: str | None = None
     """The KV cache layout resolved by the engine core, adopted by all workers."""
 

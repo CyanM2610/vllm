@@ -652,14 +652,36 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 0.05,
             ),
         )
+        self.counter_hotprefix_projection_invocations = self._counter_cls(
+            name="vllm:hotprefix_projection_invocations",
+            documentation="HotPrefix projection calls and signature skips.",
+            labelnames=labelnames + ["outcome", "reason"],
+        )
+        self.counter_hotprefix_projection_work = self._counter_cls(
+            name="vllm:hotprefix_projection_work",
+            documentation="Normalized work observed by HotPrefix projection.",
+            labelnames=labelnames + ["dimension"],
+        )
         self.counter_hotprefix_promotion_bytes = self._counter_cls(
             name="vllm:hotprefix_promotion_bytes",
-            documentation="Bytes handled by HotPrefix promotion lifecycle events.",
-            labelnames=labelnames + ["outcome"],
+            documentation="HotPrefix promotion bytes split by lifecycle phase.",
+            labelnames=labelnames + ["phase", "outcome"],
         )
         self.counter_hotprefix_promotion_rejections = self._counter_cls(
             name="vllm:hotprefix_promotion_rejections",
             documentation="HotPrefix promotion rejections by bounded reason.",
+            labelnames=labelnames + ["reason"],
+        )
+        self.counter_hotprefix_promotion_attempts = self._counter_cls(
+            name="vllm:hotprefix_promotion_attempts",
+            documentation="Promotion reservation attempts by outcome and reason.",
+            labelnames=labelnames + ["outcome", "reason"],
+        )
+        self.counter_hotprefix_promotion_backoff_skips = self._counter_cls(
+            name="vllm:hotprefix_promotion_backoff_skips",
+            documentation=(
+                "Promotion candidates skipped while feasibility is unchanged."
+            ),
             labelnames=labelnames + ["reason"],
         )
         self.gauge_hotprefix_hbm_blocks = self._gauge_cls(
@@ -668,12 +690,6 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             multiprocess_mode="mostrecent",
             labelnames=labelnames + ["state"],
         )
-        self.counter_hotprefix_exact_cuckoo_divergence = self._counter_cls(
-            name="vllm:hotprefix_exact_cuckoo_divergence",
-            documentation="Exact versus cuckoo HotPrefix decision divergence.",
-            labelnames=labelnames + ["decision_kind"],
-        )
-
         #
         # Multi-modal cache
         #
@@ -1159,23 +1175,42 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 self.histogram_hotprefix_cpu_seconds.labels(
                     *labelvalues, stage
                 ).observe(float(duration_ns) / 1e9)
+            if stage == "projection":
+                self.counter_hotprefix_projection_invocations.labels(
+                    *labelvalues, outcome, reason
+                ).inc(count)
+                for dimension in (
+                    "tree_nodes",
+                    "path_nodes",
+                    "request_blocks",
+                    "blocks",
+                    "groups",
+                    "component_blocks",
+                ):
+                    self.counter_hotprefix_projection_work.labels(
+                        *labelvalues, dimension
+                    ).inc(int(entry.get(dimension, 0)))
             if kind == "promotion" and int(entry["bytes"]) > 0:
                 self.counter_hotprefix_promotion_bytes.labels(
-                    *labelvalues, outcome
+                    *labelvalues, action, outcome
                 ).inc(int(entry["bytes"]))
             if stage == "promotion" and action == "reject":
                 self.counter_hotprefix_promotion_rejections.labels(
                     *labelvalues, reason
                 ).inc(count)
-            free_blocks = entry.get("free_blocks_after")
-            if free_blocks is not None:
-                self.gauge_hotprefix_hbm_blocks.labels(*labelvalues, "free").set(
-                    int(free_blocks)
-                )
-            if kind == "divergence":
-                self.counter_hotprefix_exact_cuckoo_divergence.labels(
-                    *labelvalues, action
-                ).inc(count)
+            if kind == "decision" and stage == "promotion":
+                if action in {"reject", "reserve"}:
+                    self.counter_hotprefix_promotion_attempts.labels(
+                        *labelvalues, outcome, reason
+                    ).inc(count)
+                elif action == "skip":
+                    self.counter_hotprefix_promotion_backoff_skips.labels(
+                        *labelvalues, reason
+                    ).inc(count)
+        for state, blocks in stats.get("hbm_blocks", {}).items():
+            self.gauge_hotprefix_hbm_blocks.labels(*labelvalues, str(state)).set(
+                int(blocks)
+            )
 
     def record(
         self,

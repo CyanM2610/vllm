@@ -65,10 +65,27 @@ request. Only the final successful chunk publishes native APC hashes.
 
 HotPrefix producers record immutable events through the two-method
 `HotPrefixObservationCollector` interface (`record` and `drain`). The no-op
-adapter is used when scheduler stats are disabled; the in-memory adapter emits
-interval deltas through `SchedulerStats`. Prometheus labels contain only fixed
+adapter is selected by `--hotprefix-observability-mode off`, independently of
+general scheduler stats. `aggregate` emits interval deltas through
+`SchedulerStats`; `trace` adds sampled high-cardinality spans. Off mode returns
+before timing or event allocation. Prometheus labels contain only fixed
 stage/action/outcome/reason enums. Request IDs and prefix digests are not
 retained in aggregate stats.
+
+`HotPrefixBlockProjection` owns per-path signatures, radix-path-to-block
+mapping, arithmetic block spans, and binding invalidation behind
+`reconcile/discard/age`. Identical path/hotness/binding signatures skip group
+rebuilds. Projection metrics report invocation/skip reason, total/path nodes,
+request/projected blocks, rebuilt groups, connected-component blocks, and aging
+CPU. HBM gauges are pull snapshots for free, resident, promotion-reserved,
+STORE-pinned, and decode-headroom blocks.
+
+Promotion rejection is cached by the physical allocation epoch, residency
+generation, eviction-group epoch, and candidate hotness. Unchanged feasibility
+produces a backoff skip rather than another reservation attempt; any relevant
+epoch change reopens the candidate. Promotion bytes are separated into copy,
+publish, and fail phases. LMCache stream completion remains authoritative for
+data-plane bytes.
 
 The following immutable presets exist only for cost attribution. Normal
 production behavior remains named `hotprefix` and is unchanged when no preset

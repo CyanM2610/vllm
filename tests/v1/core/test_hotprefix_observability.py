@@ -29,6 +29,11 @@ def test_collector_drains_delta_and_resets() -> None:
         tokens=32,
         blocks=2,
         bytes=4096,
+        tree_nodes=11,
+        path_nodes=3,
+        request_blocks=4,
+        groups=2,
+        component_blocks=3,
         free_blocks_before=3,
         free_blocks_after=3,
     )
@@ -47,7 +52,16 @@ def test_collector_drains_delta_and_resets() -> None:
         == 2
     )
     assert first.cpu_duration_ns(HotPrefixStage.PROMOTION) == (2_000_000, 2_000_000)
-    assert first.work == {"tokens": 64, "blocks": 4, "bytes": 8192}
+    assert first.work == {
+        "tokens": 64,
+        "blocks": 4,
+        "bytes": 8192,
+        "tree_nodes": 22,
+        "path_nodes": 6,
+        "request_blocks": 8,
+        "groups": 4,
+        "component_blocks": 6,
+    }
     assert second.is_empty
 
 

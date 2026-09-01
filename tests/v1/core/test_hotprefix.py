@@ -14,6 +14,7 @@ if sys.platform == "win32":
     uvloop.__dict__["run"] = asyncio.run
     sys.modules.setdefault("uvloop", uvloop)
 
+import vllm.v1.core.kv_cache_manager as kv_cache_manager_module
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
@@ -132,6 +133,21 @@ def test_local_tree_splits_history_and_initializes_a_new_branch() -> None:
         by_prefix[(1, 2, 3, 4)].prefix_id,
         by_prefix[(1, 2, 9, 10)].prefix_id,
     )
+
+
+def test_path_snapshot_excludes_unrelated_radix_branches() -> None:
+    tree = LocalHotPrefixTree(
+        hotness_store=ExactHotnessStore(),
+        namespace=b"model-a",
+        aging_interval=100,
+    )
+    tree.publish((1, 2, 3, 4))
+    tree.record_match((1, 2, 9, 10), matched_tokens=2)
+    tree.publish((1, 2, 9, 10))
+
+    path = tree.path_snapshot((1, 2, 3, 4))
+
+    assert [node.full_prefix for node in path] == [(1, 2), (1, 2, 3, 4)]
 
 
 def test_eviction_group_uses_reclaimable_length_and_hottest_affected_node() -> None:
@@ -335,7 +351,7 @@ def test_kv_cache_manager_enables_hotprefix_without_changing_default_lru() -> No
         hash_block_size=4,
     )
     lru = KVCacheManager(
-        KVCacheConfig(8, [], [group]),
+        KVCacheConfig(8, [], [group], hotprefix_observability_mode="aggregate"),
         max_model_len=32,
         scheduler_block_size=4,
         hash_block_size=4,
@@ -345,6 +361,86 @@ def test_kv_cache_manager_enables_hotprefix_without_changing_default_lru() -> No
     assert hotprefix.block_pool.eviction_selector is not None
     assert lru.hotprefix_tree is None
     assert lru.block_pool.eviction_selector is None
+    assert lru.make_hotprefix_stats().is_empty
+
+
+def test_hotprefix_observability_off_skips_timing_before_event_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_none_hash(sha256)
+    group = KVCacheGroupSpec(
+        ["layer"],
+        FullAttentionSpec(
+            block_size=4,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+        ),
+    )
+    manager = KVCacheManager(
+        KVCacheConfig(
+            num_blocks=8,
+            kv_cache_tensors=[],
+            kv_cache_groups=[group],
+            prefix_cache_eviction_policy="hotprefix",
+            hotprefix_num_buckets=8,
+            hotprefix_observability_mode="off",
+        ),
+        max_model_len=32,
+        scheduler_block_size=4,
+        hash_block_size=4,
+        log_stats=True,
+    )
+
+    def fail_timing() -> int:
+        raise AssertionError("off mode must not read the observation clock")
+
+    monkeypatch.setattr(kv_cache_manager_module.time, "monotonic_ns", fail_timing)
+    request = Request(
+        "off-mode",
+        [1, 2, 3, 4],
+        SamplingParams(max_tokens=1),
+        None,
+        block_hasher=get_request_block_hasher(4, sha256),
+    )
+
+    assert manager.allocate_slots(request, num_new_tokens=4) is not None
+    assert manager.make_hotprefix_stats().is_empty
+
+
+def test_hotprefix_aggregate_stats_include_pull_hbm_state() -> None:
+    group = KVCacheGroupSpec(
+        ["layer"],
+        FullAttentionSpec(
+            block_size=4,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+        ),
+    )
+    manager = KVCacheManager(
+        KVCacheConfig(
+            num_blocks=8,
+            kv_cache_tensors=[],
+            kv_cache_groups=[group],
+            prefix_cache_eviction_policy="hotprefix",
+            hotprefix_num_buckets=8,
+            hotprefix_observability_mode="aggregate",
+        ),
+        max_model_len=32,
+        scheduler_block_size=4,
+        hash_block_size=4,
+    )
+
+    stats = manager.make_hotprefix_stats()
+
+    assert stats.hbm_blocks == {
+        "free": 7,
+        "resident": 0,
+        "promotion_reserved": 0,
+        "store_pinned": 0,
+        "decode_headroom": 0,
+    }
 
 
 def test_shadow_local_projects_blocks_without_changing_lru_eviction() -> None:
@@ -403,6 +499,7 @@ def test_hotprefix_promotion_keeps_one_transfer_worth_of_decode_headroom() -> No
             kv_cache_groups=[group],
             prefix_cache_eviction_policy="hotprefix",
             hotprefix_num_buckets=8,
+            hotprefix_observability_mode="aggregate",
         ),
         max_model_len=32,
         scheduler_block_size=4,
@@ -421,11 +518,28 @@ def test_hotprefix_promotion_keeps_one_transfer_worth_of_decode_headroom() -> No
         )
         is None
     )
+    assert (
+        manager.reserve_hotprefix_promotion(
+            prefix_id=b"starvation-guard",
+            token_ids=range(8),
+            total_bytes=2 * page_size,
+            min_free_blocks=0,
+        )
+        is None
+    )
     rejected = manager.make_hotprefix_stats()
     assert (
         rejected.decision_count(
             HotPrefixStage.PROMOTION,
             HotPrefixAction.REJECT,
+            HotPrefixReason.HEADROOM,
+        )
+        == 1
+    )
+    assert (
+        rejected.decision_count(
+            HotPrefixStage.PROMOTION,
+            HotPrefixAction.SKIP,
             HotPrefixReason.HEADROOM,
         )
         == 1
