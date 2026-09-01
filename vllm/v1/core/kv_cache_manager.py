@@ -12,8 +12,6 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.hotprefix import (
     CuckooHotnessStore,
-    EvictionGroup,
-    EvictionNode,
     EvictionStoreCandidate,
     HotPrefixBlockEvictionSelector,
     HotPrefixEvictionDeferred,
@@ -35,6 +33,11 @@ from vllm.v1.core.hotprefix_observability import (
     NoOpHotPrefixObservationCollector,
 )
 from vllm.v1.core.hotprefix_presets import resolve_hotprefix_capabilities
+from vllm.v1.core.hotprefix_projection import HotPrefixBlockProjection
+from vllm.v1.core.hotprefix_retry import (
+    PromotionFeasibilityState,
+    PromotionRetryBackoff,
+)
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     get_kv_cache_coordinator,
@@ -198,9 +201,19 @@ class KVCacheManager:
             kv_cache_config.prefix_cache_eviction_policy,
             kv_cache_config.hotprefix_experiment_preset,
         )
+        self.hotprefix_observability_mode = kv_cache_config.hotprefix_observability_mode
+        if self.hotprefix_observability_mode not in {"off", "aggregate", "trace"}:
+            raise ValueError("invalid HotPrefix observability mode")
+        self._hotprefix_observability_enabled = (
+            self.hotprefix_capabilities.shadow_local
+            and self.hotprefix_observability_mode != "off"
+        )
         self.hotprefix_observations = (
-            InMemoryHotPrefixObservationCollector()
-            if self.hotprefix_capabilities.shadow_local and log_stats
+            InMemoryHotPrefixObservationCollector(
+                trace_enabled=self.hotprefix_observability_mode == "trace"
+            )
+            if self.hotprefix_capabilities.shadow_local
+            and self._hotprefix_observability_enabled
             else NoOpHotPrefixObservationCollector()
         )
         self.hotprefix_tree: LocalHotPrefixTree | None = None
@@ -209,9 +222,12 @@ class KVCacheManager:
         self._hotprefix_namespace = hotprefix_namespace
         self._hotprefix_aging_interval = kv_cache_config.hotprefix_aging_interval
         self._hotprefix_reserved_stores: set[bytes] = set()
+        self._hotprefix_reserved_store_blocks: dict[bytes, int] = {}
         self._hotprefix_observed_request_ids: set[str] = set()
         self.hotprefix_eviction_selector: HotPrefixBlockEvictionSelector | None = None
         self.hotprefix_promotion_manager: PromotionManager | None = None
+        self._promotion_retry_backoff = PromotionRetryBackoff()
+        self.hotprefix_projection: HotPrefixBlockProjection | None = None
         self._hotprefix_block_size = scheduler_block_size
         self._hotprefix_page_size_bytes = 0
         self.hotprefix_hash_block_size = hash_block_size
@@ -236,6 +252,12 @@ class KVCacheManager:
                 ),
             )
             self.block_pool.eviction_selector = self.hotprefix_eviction_selector
+            self.hotprefix_projection = HotPrefixBlockProjection(
+                self.hotprefix_eviction_selector
+            )
+            self.hotprefix_eviction_selector.set_discard_observer(
+                self.hotprefix_projection.discard
+            )
             if self.hotprefix_capabilities.promotion:
                 self.hotprefix_promotion_manager = PromotionManager(max_inflight=1)
         elif kv_cache_config.prefix_cache_eviction_policy != "lru":
@@ -247,6 +269,7 @@ class KVCacheManager:
         # admitting waiting/preempted requests, to avoid frequent preemptions.
         assert watermark >= 0.0, "watermark must be non-negative"
         self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
+        self._hotprefix_decode_headroom = self.watermark_blocks
         self.kv_cache_event_metadata = tuple(
             (
                 get_kv_cache_spec_kind(group.kv_cache_spec).value,
@@ -292,7 +315,22 @@ class KVCacheManager:
 
     def make_hotprefix_stats(self) -> HotPrefixStats:
         """Return and reset HotPrefix observation deltas."""
-        return self.hotprefix_observations.drain()
+        stats = self.hotprefix_observations.drain()
+        if not self._hotprefix_observability_enabled:
+            return stats
+        promotion_reserved = (
+            self.hotprefix_promotion_manager.reserved_block_count()
+            if self.hotprefix_promotion_manager is not None
+            else 0
+        )
+        hbm_blocks = (
+            ("free", self.block_pool.get_num_uncached_free_blocks()),
+            ("resident", self.block_pool.get_num_cached_blocks()),
+            ("promotion_reserved", promotion_reserved),
+            ("store_pinned", sum(self._hotprefix_reserved_store_blocks.values())),
+            ("decode_headroom", self._hotprefix_decode_headroom),
+        )
+        return HotPrefixStats(stats.entries, hbm_blocks)
 
     def prefix_cache_lookup_enabled(self, request: Request) -> bool:
         """Whether a local prefix cache lookup may be run for this request."""
@@ -381,26 +419,43 @@ class KVCacheManager:
             and request.request_id not in self._hotprefix_observed_request_ids
         ):
             aging_epoch = hotprefix_tree.aging_epoch
-            started_ns = time.monotonic_ns()
+            started_ns = (
+                time.monotonic_ns() if self._hotprefix_observability_enabled else 0
+            )
             hotprefix_tree.record_match(
                 request.all_token_ids,
                 matched_tokens=num_new_computed_tokens,
             )
-            self.hotprefix_observations.record(
-                HotPrefixObservation(
-                    kind=HotPrefixEventKind.CPU,
-                    stage=HotPrefixStage.LOCAL_TREE,
-                    action=HotPrefixAction.OBSERVE,
-                    duration_ns=time.monotonic_ns() - started_ns,
-                    tokens=len(request.all_token_ids),
-                    request_id=request.request_id,
+            if self._hotprefix_observability_enabled:
+                self.hotprefix_observations.record(
+                    HotPrefixObservation(
+                        kind=HotPrefixEventKind.CPU,
+                        stage=HotPrefixStage.LOCAL_TREE,
+                        action=HotPrefixAction.OBSERVE,
+                        duration_ns=time.monotonic_ns() - started_ns,
+                        tokens=len(request.all_token_ids),
+                        request_id=request.request_id,
+                    )
                 )
-            )
             if (
                 hotprefix_tree.aging_epoch != aging_epoch
-                and self.hotprefix_eviction_selector is not None
+                and self.hotprefix_projection is not None
             ):
-                self.hotprefix_eviction_selector.age_all()
+                age_started_ns = (
+                    time.monotonic_ns() if self._hotprefix_observability_enabled else 0
+                )
+                self.hotprefix_projection.age()
+                if self._hotprefix_observability_enabled:
+                    self.hotprefix_observations.record(
+                        HotPrefixObservation(
+                            kind=HotPrefixEventKind.CPU,
+                            stage=HotPrefixStage.AGING,
+                            action=HotPrefixAction.OBSERVE,
+                            outcome=HotPrefixOutcome.SUCCESS,
+                            duration_ns=time.monotonic_ns() - age_started_ns,
+                            tree_nodes=hotprefix_tree.node_count,
+                        )
+                    )
             self._update_hotprefix_priorities(
                 request.all_token_ids,
                 computed_blocks,
@@ -898,18 +953,19 @@ class KVCacheManager:
         token_ids = request.all_token_ids[:cached_tokens]
         if not token_ids:
             return
-        started_ns = time.monotonic_ns()
+        started_ns = time.monotonic_ns() if self._hotprefix_observability_enabled else 0
         hotprefix_tree.publish(token_ids)
-        self.hotprefix_observations.record(
-            HotPrefixObservation(
-                kind=HotPrefixEventKind.CPU,
-                stage=HotPrefixStage.LOCAL_TREE,
-                action=HotPrefixAction.PUBLISH,
-                duration_ns=time.monotonic_ns() - started_ns,
-                tokens=len(token_ids),
-                request_id=request.request_id,
+        if self._hotprefix_observability_enabled:
+            self.hotprefix_observations.record(
+                HotPrefixObservation(
+                    kind=HotPrefixEventKind.CPU,
+                    stage=HotPrefixStage.LOCAL_TREE,
+                    action=HotPrefixAction.PUBLISH,
+                    duration_ns=time.monotonic_ns() - started_ns,
+                    tokens=len(token_ids),
+                    request_id=request.request_id,
+                )
             )
-        )
         self._update_hotprefix_priorities(
             token_ids,
             self.coordinator.get_blocks(request.request_id),
@@ -923,66 +979,53 @@ class KVCacheManager:
         *,
         tree: LocalHotPrefixTree,
     ) -> None:
-        selector = self.hotprefix_eviction_selector
-        if selector is None or not blocks:
+        projection = self.hotprefix_projection
+        if projection is None or not blocks:
             return
-        started_ns = time.monotonic_ns()
-        request_tokens = tuple(token_ids)
-        path = [
-            node
-            for node in tree.snapshot()
-            if node.valid
-            if len(node.full_prefix) <= len(request_tokens)
-            and request_tokens[: len(node.full_prefix)] == node.full_prefix
-        ]
-        groups = []
-        for node in path:
-            node_end = len(node.full_prefix)
-            node_start = node_end - len(node.segment)
-            block_ids = tuple(
-                block.block_id
-                for block_index, block in enumerate(blocks[0])
-                if not block.is_null
-                and block_index * self._hotprefix_block_size < node_end
-                and (block_index + 1) * self._hotprefix_block_size > node_start
-            )
-            if block_ids:
-                groups.append(
-                    EvictionGroup(
-                        (
-                            EvictionNode(
-                                node.prefix_id,
-                                node.record.frequency,
-                                node.record.clock,
-                                tree.namespace,
-                                node.full_prefix,
-                                tuple(
-                                    block.block_id
-                                    for block in blocks[0][
-                                        : cdiv(
-                                            len(node.full_prefix),
-                                            self._hotprefix_block_size,
-                                        )
-                                    ]
-                                    if not block.is_null
-                                ),
-                            ),
-                        ),
-                        block_ids,
-                        self._hotprefix_block_size,
-                    )
-                )
-        selector.update_groups(groups)
-        self.hotprefix_observations.record(
-            HotPrefixObservation(
-                kind=HotPrefixEventKind.CPU,
-                stage=HotPrefixStage.PROJECTION,
-                action=HotPrefixAction.OBSERVE,
-                duration_ns=time.monotonic_ns() - started_ns,
-                tokens=len(token_ids),
-                blocks=sum(len(group.block_ids) for group in groups),
-            )
+        started_ns = time.monotonic_ns() if self._hotprefix_observability_enabled else 0
+        path = tree.path_snapshot(token_ids)
+        result = projection.reconcile(
+            namespace=tree.namespace,
+            cached_tokens=len(token_ids),
+            path=path,
+            physical_block_ids=tuple(
+                None if block.is_null else block.block_id for block in blocks[0]
+            ),
+            block_size=self._hotprefix_block_size,
+            aging_epoch=tree.aging_epoch,
+            total_tree_nodes=tree.node_count,
         )
+        if self._hotprefix_observability_enabled:
+            projection_reason = {
+                "identical": HotPrefixReason.IDENTICAL,
+                "topology": HotPrefixReason.TOPOLOGY_CHANGED,
+                "hotness": HotPrefixReason.HOTNESS_CHANGED,
+                "binding": HotPrefixReason.BINDING_CHANGED,
+            }[result.reason]
+            self.hotprefix_observations.record(
+                HotPrefixObservation(
+                    kind=HotPrefixEventKind.CPU,
+                    stage=HotPrefixStage.PROJECTION,
+                    action=HotPrefixAction.OBSERVE,
+                    outcome=(
+                        HotPrefixOutcome.SKIPPED
+                        if result.skipped
+                        else HotPrefixOutcome.SUCCESS
+                    ),
+                    reason=projection_reason,
+                    duration_ns=time.monotonic_ns() - started_ns,
+                    tokens=len(token_ids),
+                    blocks=result.projected_blocks,
+                    tree_nodes=result.tree_nodes,
+                    path_nodes=result.path_nodes,
+                    request_blocks=result.request_blocks,
+                    groups=result.groups_rebuilt,
+                    component_blocks=result.max_component_blocks,
+                    prefix_digest=(path[-1].prefix_id.hex() if path else None),
+                    local_frequency=(path[-1].record.frequency if path else None),
+                    local_clock=path[-1].record.clock if path else None,
+                )
+            )
 
     def reserve_hotprefix_eviction_store(
         self,
@@ -1032,6 +1075,7 @@ class KVCacheManager:
                     continue
                 self.block_pool.touch(source_blocks)
                 self._hotprefix_reserved_stores.add(node.prefix_id)
+                self._hotprefix_reserved_store_blocks[node.prefix_id] = len(source_ids)
                 selector.mark_group_pending(group.block_ids)
                 candidate = EvictionStoreCandidate(
                     node.namespace,
@@ -1043,37 +1087,39 @@ class KVCacheManager:
                     node.frequency,
                     node.clock,
                 )
-                self.hotprefix_observations.record(
-                    HotPrefixObservation(
-                        kind=HotPrefixEventKind.DECISION,
-                        stage=HotPrefixStage.EVICTION,
-                        action=HotPrefixAction.RESERVE,
-                        outcome=HotPrefixOutcome.SUCCESS,
-                        tokens=len(candidate.token_ids),
-                        blocks=len(candidate.eviction_group_block_ids),
-                        bytes=candidate.size_bytes,
-                        free_blocks_before=free_blocks_before,
-                        free_blocks_after=self.block_pool.get_num_free_blocks(),
-                        local_frequency=candidate.frequency,
-                        local_clock=candidate.clock,
+                if self._hotprefix_observability_enabled:
+                    self.hotprefix_observations.record(
+                        HotPrefixObservation(
+                            kind=HotPrefixEventKind.DECISION,
+                            stage=HotPrefixStage.EVICTION,
+                            action=HotPrefixAction.RESERVE,
+                            outcome=HotPrefixOutcome.SUCCESS,
+                            tokens=len(candidate.token_ids),
+                            blocks=len(candidate.eviction_group_block_ids),
+                            bytes=candidate.size_bytes,
+                            free_blocks_before=free_blocks_before,
+                            free_blocks_after=self.block_pool.get_num_free_blocks(),
+                            local_frequency=candidate.frequency,
+                            local_clock=candidate.clock,
+                        )
                     )
-                )
                 return candidate
-        self.hotprefix_observations.record(
-            HotPrefixObservation(
-                kind=HotPrefixEventKind.DECISION,
-                stage=HotPrefixStage.EVICTION,
-                action=HotPrefixAction.REJECT,
-                outcome=HotPrefixOutcome.SKIPPED,
-                reason=(
-                    HotPrefixReason.CAPACITY
-                    if deferred_groups
-                    else HotPrefixReason.SOURCE_MISSING
-                ),
-                free_blocks_before=free_blocks_before,
-                free_blocks_after=self.block_pool.get_num_free_blocks(),
+        if self._hotprefix_observability_enabled:
+            self.hotprefix_observations.record(
+                HotPrefixObservation(
+                    kind=HotPrefixEventKind.DECISION,
+                    stage=HotPrefixStage.EVICTION,
+                    action=HotPrefixAction.REJECT,
+                    outcome=HotPrefixOutcome.SKIPPED,
+                    reason=(
+                        HotPrefixReason.CAPACITY
+                        if deferred_groups
+                        else HotPrefixReason.SOURCE_MISSING
+                    ),
+                    free_blocks_before=free_blocks_before,
+                    free_blocks_after=self.block_pool.get_num_free_blocks(),
+                )
             )
-        )
         return None
 
     def release_hotprefix_eviction_store(
@@ -1083,6 +1129,7 @@ class KVCacheManager:
         if candidate.prefix_id not in self._hotprefix_reserved_stores:
             raise RuntimeError("HotPrefix eviction STORE source is not reserved")
         self._hotprefix_reserved_stores.remove(candidate.prefix_id)
+        self._hotprefix_reserved_store_blocks.pop(candidate.prefix_id)
         selector = self.hotprefix_eviction_selector
         if selector is None:
             raise RuntimeError("HotPrefix eviction selector disappeared")
@@ -1090,18 +1137,19 @@ class KVCacheManager:
         self.block_pool.free_blocks(
             [self.block_pool.blocks[block_id] for block_id in candidate.block_ids]
         )
-        self.hotprefix_observations.record(
-            HotPrefixObservation(
-                kind=HotPrefixEventKind.DECISION,
-                stage=HotPrefixStage.EVICTION,
-                action=HotPrefixAction.RELEASE,
-                outcome=HotPrefixOutcome.SUCCESS,
-                tokens=len(candidate.token_ids),
-                blocks=len(candidate.block_ids),
-                bytes=candidate.size_bytes,
-                free_blocks_after=self.block_pool.get_num_free_blocks(),
+        if self._hotprefix_observability_enabled:
+            self.hotprefix_observations.record(
+                HotPrefixObservation(
+                    kind=HotPrefixEventKind.DECISION,
+                    stage=HotPrefixStage.EVICTION,
+                    action=HotPrefixAction.RELEASE,
+                    outcome=HotPrefixOutcome.SUCCESS,
+                    tokens=len(candidate.token_ids),
+                    blocks=len(candidate.block_ids),
+                    bytes=candidate.size_bytes,
+                    free_blocks_after=self.block_pool.get_num_free_blocks(),
+                )
             )
-        )
 
     def reserve_hotprefix_promotion(
         self,
@@ -1110,6 +1158,9 @@ class KVCacheManager:
         token_ids: Sequence[int],
         total_bytes: int,
         min_free_blocks: int = 1,
+        residency_epoch: int = 0,
+        local_frequency: int = 0,
+        local_clock: int = 0,
     ) -> PromotionTransaction | None:
         """Reserve detached HBM target blocks after foreground scheduling.
 
@@ -1121,50 +1172,81 @@ class KVCacheManager:
         manager = self.hotprefix_promotion_manager
         if manager is None:
             return None
+        feasibility = self._promotion_feasibility_state(
+            residency_epoch=residency_epoch,
+            local_frequency=local_frequency,
+            local_clock=local_clock,
+        )
+        cached_rejection = self._promotion_retry_backoff.rejection_for(
+            prefix_id, feasibility
+        )
+        if cached_rejection is not None:
+            if self._hotprefix_observability_enabled:
+                self.hotprefix_observations.record(
+                    HotPrefixObservation(
+                        kind=HotPrefixEventKind.DECISION,
+                        stage=HotPrefixStage.PROMOTION,
+                        action=HotPrefixAction.SKIP,
+                        outcome=HotPrefixOutcome.SKIPPED,
+                        reason=cached_rejection,
+                    )
+                )
+            return None
         num_blocks = cdiv(len(token_ids), self._hotprefix_block_size)
         free_blocks_before = self.block_pool.get_num_free_blocks()
         if len(token_ids) % self._hotprefix_block_size != 0:
             self._record_promotion_rejection(
+                prefix_id,
                 HotPrefixReason.UNALIGNED,
                 num_blocks,
                 total_bytes,
                 free_blocks_before,
+                feasibility,
             )
             return None
         page_size_bytes = self._hotprefix_page_size_bytes
         if total_bytes != num_blocks * page_size_bytes:
             self._record_promotion_rejection(
+                prefix_id,
                 HotPrefixReason.INVALID,
                 num_blocks,
                 total_bytes,
                 free_blocks_before,
+                feasibility,
             )
             return None
         decode_headroom = max(min_free_blocks, num_blocks)
+        self._hotprefix_decode_headroom = decode_headroom
         if self.block_pool.get_num_free_blocks() - num_blocks < decode_headroom:
             self._record_promotion_rejection(
+                prefix_id,
                 HotPrefixReason.HEADROOM,
                 num_blocks,
                 total_bytes,
                 free_blocks_before,
+                feasibility,
             )
             return None
         if manager.get(prefix_id) is not None:
             self._record_promotion_rejection(
+                prefix_id,
                 HotPrefixReason.INFLIGHT,
                 num_blocks,
                 total_bytes,
                 free_blocks_before,
+                feasibility,
             )
             return None
         try:
             target_blocks = self.block_pool.get_new_blocks(num_blocks)
         except HotPrefixEvictionDeferred:
             self._record_promotion_rejection(
+                prefix_id,
                 HotPrefixReason.CONFLICT,
                 num_blocks,
                 total_bytes,
                 free_blocks_before,
+                feasibility,
             )
             return None
         transaction = manager.start(
@@ -1172,19 +1254,21 @@ class KVCacheManager:
             total_bytes=total_bytes,
             target_block_ids=tuple(block.block_id for block in target_blocks),
         )
-        self.hotprefix_observations.record(
-            HotPrefixObservation(
-                kind=HotPrefixEventKind.DECISION,
-                stage=HotPrefixStage.PROMOTION,
-                action=HotPrefixAction.RESERVE,
-                outcome=HotPrefixOutcome.SUCCESS,
-                tokens=len(token_ids),
-                blocks=num_blocks,
-                bytes=total_bytes,
-                free_blocks_before=free_blocks_before,
-                free_blocks_after=self.block_pool.get_num_free_blocks(),
+        self._promotion_retry_backoff.record_success(prefix_id)
+        if self._hotprefix_observability_enabled:
+            self.hotprefix_observations.record(
+                HotPrefixObservation(
+                    kind=HotPrefixEventKind.DECISION,
+                    stage=HotPrefixStage.PROMOTION,
+                    action=HotPrefixAction.RESERVE,
+                    outcome=HotPrefixOutcome.SUCCESS,
+                    tokens=len(token_ids),
+                    blocks=num_blocks,
+                    bytes=total_bytes,
+                    free_blocks_before=free_blocks_before,
+                    free_blocks_after=self.block_pool.get_num_free_blocks(),
+                )
             )
-        )
         return transaction
 
     def publish_hotprefix_promotion(
@@ -1228,17 +1312,18 @@ class KVCacheManager:
         self.block_pool.free_blocks(blocks)
         waiters = manager.take_waiters(prefix_id)
         manager.retire(prefix_id)
-        self.hotprefix_observations.record(
-            HotPrefixObservation(
-                kind=HotPrefixEventKind.PROMOTION,
-                stage=HotPrefixStage.PROMOTION,
-                action=HotPrefixAction.PUBLISH,
-                outcome=HotPrefixOutcome.SUCCESS,
-                tokens=len(token_ids),
-                blocks=len(blocks),
-                bytes=transaction.total_bytes,
+        if self._hotprefix_observability_enabled:
+            self.hotprefix_observations.record(
+                HotPrefixObservation(
+                    kind=HotPrefixEventKind.PROMOTION,
+                    stage=HotPrefixStage.PROMOTION,
+                    action=HotPrefixAction.PUBLISH,
+                    outcome=HotPrefixOutcome.SUCCESS,
+                    tokens=len(token_ids),
+                    blocks=len(blocks),
+                    bytes=transaction.total_bytes,
+                )
             )
-        )
         return waiters
 
     def advance_hotprefix_promotion(
@@ -1248,19 +1333,20 @@ class KVCacheManager:
         manager = self.hotprefix_promotion_manager
         if manager is None:
             raise RuntimeError("HotPrefix promotion is disabled")
-        manager.advance(prefix_id, budget_bytes=copied_bytes)
+        copied = manager.advance(prefix_id, budget_bytes=copied_bytes)
         transaction = manager.get(prefix_id)
         assert transaction is not None
-        self.hotprefix_observations.record(
-            HotPrefixObservation(
-                kind=HotPrefixEventKind.PROMOTION,
-                stage=HotPrefixStage.PROMOTION,
-                action=HotPrefixAction.COPY,
-                outcome=HotPrefixOutcome.SUCCESS,
-                bytes=copied_bytes,
-                blocks=len(transaction.target_block_ids),
+        if self._hotprefix_observability_enabled:
+            self.hotprefix_observations.record(
+                HotPrefixObservation(
+                    kind=HotPrefixEventKind.PROMOTION,
+                    stage=HotPrefixStage.PROMOTION,
+                    action=HotPrefixAction.COPY,
+                    outcome=HotPrefixOutcome.SUCCESS,
+                    bytes=copied,
+                    blocks=len(transaction.target_block_ids),
+                )
             )
-        )
         return transaction.state is PromotionState.READY
 
     def fail_hotprefix_promotion(self, prefix_id: bytes) -> tuple[str, ...]:
@@ -1281,16 +1367,17 @@ class KVCacheManager:
         )
         waiters = manager.take_waiters(prefix_id)
         manager.retire(prefix_id)
-        self.hotprefix_observations.record(
-            HotPrefixObservation(
-                kind=HotPrefixEventKind.PROMOTION,
-                stage=HotPrefixStage.PROMOTION,
-                action=HotPrefixAction.FAIL,
-                outcome=HotPrefixOutcome.FAILURE,
-                blocks=len(transaction.target_block_ids),
-                bytes=transaction.total_bytes,
+        if self._hotprefix_observability_enabled:
+            self.hotprefix_observations.record(
+                HotPrefixObservation(
+                    kind=HotPrefixEventKind.PROMOTION,
+                    stage=HotPrefixStage.PROMOTION,
+                    action=HotPrefixAction.FAIL,
+                    outcome=HotPrefixOutcome.FAILURE,
+                    blocks=len(transaction.target_block_ids),
+                    bytes=transaction.total_bytes,
+                )
             )
-        )
         return waiters
 
     def get_hotprefix_tree(
@@ -1469,11 +1556,16 @@ class KVCacheManager:
 
     def _record_promotion_rejection(
         self,
+        prefix_id: bytes,
         reason: HotPrefixReason,
         blocks: int,
         total_bytes: int,
         free_blocks_before: int,
+        feasibility: PromotionFeasibilityState,
     ) -> None:
+        self._promotion_retry_backoff.record_rejection(prefix_id, feasibility, reason)
+        if not self._hotprefix_observability_enabled:
+            return
         self.hotprefix_observations.record(
             HotPrefixObservation(
                 kind=HotPrefixEventKind.DECISION,
@@ -1486,4 +1578,19 @@ class KVCacheManager:
                 free_blocks_before=free_blocks_before,
                 free_blocks_after=self.block_pool.get_num_free_blocks(),
             )
+        )
+
+    def _promotion_feasibility_state(
+        self,
+        *,
+        residency_epoch: int,
+        local_frequency: int,
+        local_clock: int,
+    ) -> PromotionFeasibilityState:
+        selector = self.hotprefix_eviction_selector
+        return PromotionFeasibilityState(
+            free_block_epoch=self.block_pool.state_epoch,
+            residency_epoch=residency_epoch,
+            group_epoch=selector.state_epoch if selector is not None else 0,
+            hotness_version=(local_frequency, local_clock),
         )

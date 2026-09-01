@@ -503,6 +503,8 @@ def test_hotprefix_cli_options(monkeypatch):
             "32",
             "--hotprefix-experiment-preset",
             "ablation_access_only",
+            "--hotprefix-observability-mode",
+            "trace",
         ]
     )
 
@@ -510,6 +512,7 @@ def test_hotprefix_cli_options(monkeypatch):
     assert args.hotprefix_aging_interval == 17
     assert args.hotprefix_num_buckets == 32
     assert args.hotprefix_experiment_preset == "ablation_access_only"
+    assert args.hotprefix_observability_mode == "trace"
 
 
 def test_prefix_cache_retention_interval_from_deprecated_env(

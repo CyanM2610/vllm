@@ -1418,6 +1418,9 @@ def get_kv_cache_config_from_groups(
             hotprefix_experiment_preset=(
                 vllm_config.cache_config.hotprefix_experiment_preset
             ),
+            hotprefix_observability_mode=(
+                vllm_config.cache_config.hotprefix_observability_mode
+            ),
         )
 
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
@@ -1489,6 +1492,9 @@ def get_kv_cache_config_from_groups(
         hotprefix_num_buckets=vllm_config.cache_config.hotprefix_num_buckets,
         hotprefix_experiment_preset=(
             vllm_config.cache_config.hotprefix_experiment_preset
+        ),
+        hotprefix_observability_mode=(
+            vllm_config.cache_config.hotprefix_observability_mode
         ),
     )
 

@@ -204,6 +204,7 @@ class BlockPool:
         # avoid freeing it.
         self.null_block = self.free_block_queue.popleft()
         self.null_block.is_null = True
+        self._state_epoch = 0
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
@@ -700,6 +701,8 @@ class BlockPool:
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+        if ret:
+            self._state_epoch += 1
         return ret
 
     def ensure_allocation_ready(self, num_blocks: int) -> None:
@@ -800,14 +803,18 @@ class BlockPool:
         Args:
             blocks: A list of blocks to touch.
         """
+        free_state_changed = False
         for block in blocks:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
+                free_state_changed = True
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
+        if free_state_changed:
+            self._state_epoch += 1
 
     def is_block_writable(self, block: KVCacheBlock) -> bool:
         """Return whether a block can be mutated by its sole owner."""
@@ -838,6 +845,8 @@ class BlockPool:
         self.free_block_queue.prepend_n(blocks_to_evict_first)
         # Blocks to reuse last are appended to the end of the free queue.
         self.free_block_queue.append_n(blocks_to_evict_last)
+        if blocks_to_evict_first or blocks_to_evict_last:
+            self._state_epoch += 1
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -901,6 +910,23 @@ class BlockPool:
             The number of free blocks.
         """
         return self.free_block_queue.num_free_blocks
+
+    def get_num_cached_blocks(self) -> int:
+        """Return physical blocks currently addressable by cached hashes."""
+        return len(self.cached_block_hashes_by_block)
+
+    def get_num_uncached_free_blocks(self) -> int:
+        """Return immediately reusable blocks with no resident cache hash."""
+        return sum(
+            block.block_hash is None
+            and block.block_id not in self.cached_block_hashes_by_block
+            for block in self.free_block_queue.get_all_free_blocks()
+        )
+
+    @property
+    def state_epoch(self) -> int:
+        """Return the monotonic physical allocation feasibility epoch."""
+        return self._state_epoch
 
     def get_usage(self) -> float:
         """Get the KV cache usage.

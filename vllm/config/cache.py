@@ -78,6 +78,7 @@ HotPrefixExperimentPreset = Literal[
     "ablation_on_demand",
     "hotprefix",
 ]
+HotPrefixObservabilityMode = Literal["off", "aggregate", "trace"]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
 
@@ -154,6 +155,8 @@ class CacheConfig:
     """Power-of-two bucket count for the HotPrefix cuckoo metadata store."""
     hotprefix_experiment_preset: HotPrefixExperimentPreset | None = None
     """Experiment-only immutable HotPrefix cost-ablation preset."""
+    hotprefix_observability_mode: HotPrefixObservabilityMode = "off"
+    """Immutable HotPrefix-only observation mode."""
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:
 

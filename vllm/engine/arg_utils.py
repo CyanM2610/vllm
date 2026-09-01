@@ -70,6 +70,7 @@ from vllm.config import (
 from vllm.config.cache import (
     CacheDType,
     HotPrefixExperimentPreset,
+    HotPrefixObservabilityMode,
     KVOffloadingBackend,
     MambaCacheMode,
     MambaDType,
@@ -532,6 +533,9 @@ class EngineArgs:
     hotprefix_aging_interval: int = CacheConfig.hotprefix_aging_interval
     hotprefix_num_buckets: int = CacheConfig.hotprefix_num_buckets
     hotprefix_experiment_preset: HotPrefixExperimentPreset | None = None
+    hotprefix_observability_mode: HotPrefixObservabilityMode = (
+        CacheConfig.hotprefix_observability_mode
+    )
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
@@ -1269,6 +1273,10 @@ class EngineArgs:
         cache_group.add_argument(
             "--hotprefix-experiment-preset",
             **cache_kwargs["hotprefix_experiment_preset"],
+        )
+        cache_group.add_argument(
+            "--hotprefix-observability-mode",
+            **cache_kwargs["hotprefix_observability_mode"],
         )
         cache_group.add_argument(
             "--prefix-caching-hash-algo", **cache_kwargs["prefix_caching_hash_algo"]
@@ -2070,6 +2078,7 @@ class EngineArgs:
             hotprefix_aging_interval=self.hotprefix_aging_interval,
             hotprefix_num_buckets=self.hotprefix_num_buckets,
             hotprefix_experiment_preset=self.hotprefix_experiment_preset,
+            hotprefix_observability_mode=self.hotprefix_observability_mode,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             prefix_cache_retention_interval=self.prefix_cache_retention_interval,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,

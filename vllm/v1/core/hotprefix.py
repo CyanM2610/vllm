@@ -4,7 +4,7 @@
 """HotPrefix policy primitives for vLLM's prefix cache."""
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Protocol
@@ -539,6 +539,21 @@ class HotPrefixBlockEvictionSelector:
         self._pending_group_keys: set[frozenset[int]] = set()
         self._terminal_group_keys: set[frozenset[int]] = set()
         self._deferred_group_keys: set[frozenset[int]] = set()
+        self._discard_observer: Callable[[Sequence[int]], None] | None = None
+        self._state_epoch = 0
+
+    @property
+    def state_epoch(self) -> int:
+        """Return the monotonic projection/group feasibility epoch."""
+        return self._state_epoch
+
+    def set_discard_observer(self, observer: Callable[[Sequence[int]], None]) -> None:
+        """Notify projection state whenever physical bindings are discarded.
+
+        Args:
+            observer: Callback receiving discarded physical block IDs.
+        """
+        self._discard_observer = observer
 
     def update_priorities(self, priorities: dict[int, float]) -> None:
         """Replace priorities for the supplied physical block IDs.
@@ -549,6 +564,8 @@ class HotPrefixBlockEvictionSelector:
         if any(block_id < 0 for block_id in priorities):
             raise ValueError("block IDs must be non-negative")
         self._priorities.update(priorities)
+        if priorities:
+            self._state_epoch += 1
 
     def update_groups(self, groups: Sequence[EvictionGroup]) -> None:
         """Merge block-overlapping logical groups and publish their priorities.
@@ -557,7 +574,9 @@ class HotPrefixBlockEvictionSelector:
         nodes cannot be invalidated independently, so overlapping groups form
         one connected component and every block receives the component score.
         """
+        changed = False
         for incoming in groups:
+            changed = True
             nodes = {node.prefix_id: node for node in incoming.nodes}
             block_ids = set(incoming.block_ids)
             block_size = incoming.block_size
@@ -592,6 +611,8 @@ class HotPrefixBlockEvictionSelector:
             for block_id in merged.block_ids:
                 self._groups_by_block[block_id] = merged
                 self._priorities[block_id] = merged.priority
+        if changed:
+            self._state_epoch += 1
 
     def collateral_block_ids(
         self, selected_block_ids: Sequence[int]
@@ -648,6 +669,8 @@ class HotPrefixBlockEvictionSelector:
             for block_id in aged.block_ids:
                 self._groups_by_block[block_id] = aged
                 self._priorities[block_id] = aged.priority
+        if groups:
+            self._state_epoch += 1
 
     def deferred_groups(self) -> tuple[EvictionGroup, ...]:
         """Return actual allocation victims awaiting Host admission."""
@@ -667,6 +690,7 @@ class HotPrefixBlockEvictionSelector:
         key = frozenset(block_ids)
         self._deferred_group_keys.discard(key)
         self._pending_group_keys.add(key)
+        self._state_epoch += 1
 
     def mark_group_terminal(self, block_ids: Sequence[int]) -> None:
         """Allow reuse after DEDUP, rejection, publication, or failure."""
@@ -674,6 +698,7 @@ class HotPrefixBlockEvictionSelector:
         self._deferred_group_keys.discard(key)
         self._pending_group_keys.discard(key)
         self._terminal_group_keys.add(key)
+        self._state_epoch += 1
 
     def discard(self, block_ids: Sequence[int]) -> None:
         """Forget priorities for blocks whose cached contents were removed."""
@@ -692,6 +717,10 @@ class HotPrefixBlockEvictionSelector:
                 self._priorities.pop(grouped_block_id, None)
         for block_id in block_ids:
             self._priorities.pop(block_id, None)
+        if affected_groups or block_ids:
+            self._state_epoch += 1
+        if self._discard_observer is not None:
+            self._discard_observer(block_ids)
 
     def select_blocks(
         self,
@@ -885,6 +914,13 @@ class PromotionManager:
         """Return an active or terminal transaction before retirement."""
         return self._transactions.get(prefix_id)
 
+    def reserved_block_count(self) -> int:
+        """Return target blocks reserved by all promotion transactions."""
+        return sum(
+            len(transaction.target_block_ids)
+            for transaction in self._transactions.values()
+        )
+
     def retire(self, prefix_id: PrefixId) -> PromotionTransaction:
         """Remove a terminal transaction after blocks and waiters are handled."""
         transaction = self._transactions[prefix_id]
@@ -918,6 +954,7 @@ class LocalHotPrefixTree:
         self._aging_interval = aging_interval
         self._requests_since_aging = 0
         self._aging_epoch = 0
+        self._node_count = 0
         self._root = _RadixNode((), (), b"", 0, None)
         self._invalid_records: dict[PrefixId, HotnessRecord] = {}
 
@@ -930,6 +967,11 @@ class LocalHotPrefixTree:
     def aging_epoch(self) -> int:
         """Return the number of completed Local aging passes."""
         return self._aging_epoch
+
+    @property
+    def node_count(self) -> int:
+        """Return the number of non-root radix nodes without traversing."""
+        return self._node_count
 
     def publish(self, token_ids: Sequence[int]) -> tuple[HotPrefixNodeSnapshot, ...]:
         """Publish a computed token path into the logical radix tree.
@@ -1023,6 +1065,32 @@ class LocalHotPrefixTree:
         nodes.sort(key=lambda item: item.full_prefix)
         return tuple(self._snapshot_node(item) for item in nodes)
 
+    def path_snapshot(
+        self, token_ids: Sequence[int]
+    ) -> tuple[HotPrefixNodeSnapshot, ...]:
+        """Return immutable nodes on one token path without scanning branches.
+
+        Args:
+            token_ids: Token path to follow from the radix root.
+
+        Returns:
+            Fully matched logical nodes in root-to-leaf order.
+        """
+        remaining = self._validate_tokens(token_ids)
+        node = self._root
+        path: list[HotPrefixNodeSnapshot] = []
+        while remaining:
+            child = node.children.get(remaining[0])
+            if child is None:
+                break
+            common = self._common_prefix_length(child.segment, remaining)
+            if common < len(child.segment):
+                break
+            path.append(self._snapshot_node(child))
+            node = child
+            remaining = remaining[common:]
+        return tuple(path)
+
     def _new_node(self, parent: _RadixNode, segment: tuple[int, ...]) -> _RadixNode:
         full_prefix = parent.full_prefix + segment
         prefix_id = self._make_prefix_id(full_prefix)
@@ -1031,6 +1099,7 @@ class LocalHotPrefixTree:
             self._hotness_store.insert(prefix_id, depth=depth)
         except CuckooInsertionError:
             self._invalid_records[prefix_id] = HotnessRecord(0, 0, depth)
+        self._node_count += 1
         return _RadixNode(segment, full_prefix, prefix_id, depth, parent)
 
     def _split_node(self, child: _RadixNode, split_length: int) -> _RadixNode:
@@ -1054,6 +1123,7 @@ class LocalHotPrefixTree:
             child.depth,
             parent,
         )
+        self._node_count += 1
         if child_is_invalid:
             self._invalid_records[split_parent.prefix_id] = inherited
         else:
