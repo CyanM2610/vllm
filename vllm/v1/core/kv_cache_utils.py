@@ -1415,6 +1415,9 @@ def get_kv_cache_config_from_groups(
                 vllm_config.cache_config.hotprefix_aging_interval
             ),
             hotprefix_num_buckets=vllm_config.cache_config.hotprefix_num_buckets,
+            hotprefix_experiment_preset=(
+                vllm_config.cache_config.hotprefix_experiment_preset
+            ),
         )
 
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
@@ -1484,6 +1487,9 @@ def get_kv_cache_config_from_groups(
         ),
         hotprefix_aging_interval=vllm_config.cache_config.hotprefix_aging_interval,
         hotprefix_num_buckets=vllm_config.cache_config.hotprefix_num_buckets,
+        hotprefix_experiment_preset=(
+            vllm_config.cache_config.hotprefix_experiment_preset
+        ),
     )
 
 

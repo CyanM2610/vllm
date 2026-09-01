@@ -1228,6 +1228,8 @@ class KVCacheConfig:
     """Initial request lookups between HotPrefix clock aging passes."""
     hotprefix_num_buckets: int = 16384
     """Bucket count for the HotPrefix cuckoo metadata store."""
+    hotprefix_experiment_preset: str | None = None
+    """Resolved experiment-only HotPrefix cost-ablation preset."""
     kv_cache_layout: str | None = None
     """The KV cache layout resolved by the engine core, adopted by all workers."""
 
