@@ -5,6 +5,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from typing import Any
 
 from prometheus_client import Counter, Gauge, Histogram
 
@@ -629,6 +630,50 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             counter_connector_prefix_cache_hits, per_engine_labelvalues
         )
 
+        self.counter_hotprefix_decisions = self._counter_cls(
+            name="vllm:hotprefix_decisions",
+            documentation="HotPrefix decisions by stage, action, and reason.",
+            labelnames=labelnames + ["stage", "action", "reason"],
+        )
+        self.histogram_hotprefix_cpu_seconds = self._histogram_cls(
+            name="vllm:hotprefix_cpu_seconds",
+            documentation="CPU time spent in HotPrefix policy stages.",
+            labelnames=labelnames + ["stage"],
+            buckets=(
+                0.000001,
+                0.000005,
+                0.00001,
+                0.00005,
+                0.0001,
+                0.0005,
+                0.001,
+                0.005,
+                0.01,
+                0.05,
+            ),
+        )
+        self.counter_hotprefix_promotion_bytes = self._counter_cls(
+            name="vllm:hotprefix_promotion_bytes",
+            documentation="Bytes handled by HotPrefix promotion lifecycle events.",
+            labelnames=labelnames + ["outcome"],
+        )
+        self.counter_hotprefix_promotion_rejections = self._counter_cls(
+            name="vllm:hotprefix_promotion_rejections",
+            documentation="HotPrefix promotion rejections by bounded reason.",
+            labelnames=labelnames + ["reason"],
+        )
+        self.gauge_hotprefix_hbm_blocks = self._gauge_cls(
+            name="vllm:hotprefix_hbm_blocks",
+            documentation="HotPrefix-related HBM block observations by state.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames + ["state"],
+        )
+        self.counter_hotprefix_exact_cuckoo_divergence = self._counter_cls(
+            name="vllm:hotprefix_exact_cuckoo_divergence",
+            documentation="Exact versus cuckoo HotPrefix decision divergence.",
+            labelnames=labelnames + ["decision_kind"],
+        )
+
         #
         # Multi-modal cache
         #
@@ -1097,6 +1142,41 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             metrics_info["engine"] = str(engine_index)
             info_gauge.labels(**metrics_info).set(1)
 
+    def _observe_hotprefix_stats(self, stats: dict[str, Any], engine_idx: int) -> None:
+        labelvalues = self.per_engine_labelvalues[engine_idx]
+        for entry in stats.get("entries", []):
+            kind = str(entry["kind"])
+            stage = str(entry["stage"])
+            action = str(entry["action"])
+            outcome = str(entry["outcome"])
+            reason = str(entry["reason"])
+            count = int(entry["count"])
+            if kind == "decision":
+                self.counter_hotprefix_decisions.labels(
+                    *labelvalues, stage, action, reason
+                ).inc(count)
+            for duration_ns in entry.get("durations_ns", []):
+                self.histogram_hotprefix_cpu_seconds.labels(
+                    *labelvalues, stage
+                ).observe(float(duration_ns) / 1e9)
+            if kind == "promotion" and int(entry["bytes"]) > 0:
+                self.counter_hotprefix_promotion_bytes.labels(
+                    *labelvalues, outcome
+                ).inc(int(entry["bytes"]))
+            if stage == "promotion" and action == "reject":
+                self.counter_hotprefix_promotion_rejections.labels(
+                    *labelvalues, reason
+                ).inc(count)
+            free_blocks = entry.get("free_blocks_after")
+            if free_blocks is not None:
+                self.gauge_hotprefix_hbm_blocks.labels(*labelvalues, "free").set(
+                    int(free_blocks)
+                )
+            if kind == "divergence":
+                self.counter_hotprefix_exact_cuckoo_divergence.labels(
+                    *labelvalues, action
+                ).inc(count)
+
     def record(
         self,
         scheduler_stats: SchedulerStats | None,
@@ -1145,6 +1225,11 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             if scheduler_stats.kv_connector_stats is not None:
                 self.kv_connector_prom.observe(
                     scheduler_stats.kv_connector_stats, engine_idx
+                )
+
+            if scheduler_stats.hotprefix_stats is not None:
+                self._observe_hotprefix_stats(
+                    scheduler_stats.hotprefix_stats, engine_idx
                 )
 
             if scheduler_stats.perf_stats is not None:

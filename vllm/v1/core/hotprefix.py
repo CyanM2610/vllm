@@ -526,7 +526,14 @@ class EvictionStoreCandidate:
 class HotPrefixBlockEvictionSelector:
     """Translate logical HotPrefix priorities into BlockPool selections."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        defer_for_host: bool = True,
+        apply_hotprefix_priority: bool = True,
+    ) -> None:
+        self._defer_for_host = defer_for_host
+        self._apply_hotprefix_priority = apply_hotprefix_priority
         self._priorities: dict[int, float] = {}
         self._groups_by_block: dict[int, EvictionGroup] = {}
         self._pending_group_keys: set[frozenset[int]] = set()
@@ -590,6 +597,8 @@ class HotPrefixBlockEvictionSelector:
         self, selected_block_ids: Sequence[int]
     ) -> tuple[int, ...]:
         """Return blocks whose APC entries share a logical eviction group."""
+        if not self._apply_hotprefix_priority:
+            return ()
         selected = set(selected_block_ids)
         collateral: set[int] = set()
         for block_id in selected:
@@ -695,12 +704,16 @@ class HotPrefixBlockEvictionSelector:
         lru_position = {
             block.block_id: position for position, block in enumerate(candidates)
         }
-        ordered = sorted(
-            candidates,
-            key=lambda block: (
-                self._priorities.get(block.block_id, 0.0),
-                lru_position[block.block_id],
-            ),
+        ordered = (
+            sorted(
+                candidates,
+                key=lambda block: (
+                    self._priorities.get(block.block_id, 0.0),
+                    lru_position[block.block_id],
+                ),
+            )
+            if self._apply_hotprefix_priority
+            else candidates
         )
         eligible: list[int] = []
         deferred: set[frozenset[int]] = set()
@@ -710,7 +723,11 @@ class HotPrefixBlockEvictionSelector:
                 eligible.append(block.block_id)
             else:
                 key = frozenset(group.block_ids)
-                if key in self._terminal_group_keys:
+                if (
+                    not self._apply_hotprefix_priority
+                    or not self._defer_for_host
+                    or key in self._terminal_group_keys
+                ):
                     eligible.append(block.block_id)
                 elif key not in self._pending_group_keys:
                     deferred.add(key)

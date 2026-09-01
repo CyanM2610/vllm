@@ -70,6 +70,14 @@ MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 PrefixCacheEvictionMode = Literal["lru", "hotprefix"]
+HotPrefixExperimentPreset = Literal[
+    "ablation_shadow_local",
+    "ablation_local_drop",
+    "ablation_access_only",
+    "ablation_store_only",
+    "ablation_on_demand",
+    "hotprefix",
+]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
 
@@ -144,6 +152,8 @@ class CacheConfig:
     """Initial request lookups between HotPrefix clock aging passes."""
     hotprefix_num_buckets: int = Field(default=16384, gt=0)
     """Power-of-two bucket count for the HotPrefix cuckoo metadata store."""
+    hotprefix_experiment_preset: HotPrefixExperimentPreset | None = None
+    """Experiment-only immutable HotPrefix cost-ablation preset."""
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:
 
@@ -278,6 +288,7 @@ class CacheConfig:
             "prefix_cache_eviction_policy",
             "hotprefix_aging_interval",
             "hotprefix_num_buckets",
+            "hotprefix_experiment_preset",
             "prefix_caching_hash_algo",
             "prefix_cache_retention_interval",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
@@ -329,6 +340,13 @@ class CacheConfig:
             self.user_specified_block_size = True
         if self.mamba_block_size is not None:
             self.user_specified_mamba_block_size = True
+        if (
+            self.hotprefix_experiment_preset is not None
+            and self.prefix_cache_eviction_policy != "hotprefix"
+        ):
+            raise ValueError(
+                "HotPrefix experiment preset requires hotprefix eviction policy"
+            )
         return self
 
     @field_validator("cache_dtype", mode="after")

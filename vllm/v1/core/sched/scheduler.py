@@ -2732,6 +2732,7 @@ class Scheduler(SchedulerInterface):
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
         )
+        hotprefix_stats = self.kv_cache_manager.make_hotprefix_stats()
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
@@ -2742,6 +2743,9 @@ class Scheduler(SchedulerInterface):
             kv_cache_eviction_events=eviction_events,
             spec_decoding_stats=spec_stats,
             kv_connector_stats=connector_stats_payload,
+            hotprefix_stats=(
+                None if hotprefix_stats.is_empty else hotprefix_stats.to_dict()
+            ),
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
         )

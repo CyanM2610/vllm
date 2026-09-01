@@ -60,3 +60,30 @@ Admission also leaves at least one additional promotion-sized region free for
 foreground decode growth; when that conservative HBM headroom is unavailable,
 background promotion pauses instead of repeatedly preempting the foreground
 request. Only the final successful chunk publishes native APC hashes.
+
+## Cost observability and experiment presets
+
+HotPrefix producers record immutable events through the two-method
+`HotPrefixObservationCollector` interface (`record` and `drain`). The no-op
+adapter is used when scheduler stats are disabled; the in-memory adapter emits
+interval deltas through `SchedulerStats`. Prometheus labels contain only fixed
+stage/action/outcome/reason enums. Request IDs and prefix digests are not
+retained in aggregate stats.
+
+The following immutable presets exist only for cost attribution. Normal
+production behavior remains named `hotprefix` and is unchanged when no preset
+is supplied:
+
+| Preset | Enabled through this stage |
+| --- | --- |
+| `ablation_shadow_local` | Local tree/Cuckoo bookkeeping; LRU HBM eviction |
+| `ablation_local_drop` | HotPrefix HBM victim selection without Host residency |
+| `ablation_access_only` | Synchronous Global ACCESS, without STORE/fetch |
+| `ablation_store_only` | Selective admission and eviction STORE |
+| `ablation_on_demand` | Native Host lookup/retrieve |
+| `hotprefix` | Background promotion and the faithful complete policy |
+
+Configure them with `--hotprefix-experiment-preset` together with
+`--prefix-cache-eviction-policy hotprefix`. Combining a preset with `lru` is
+rejected at startup; native LRU is the P0 experiment baseline and uses no
+preset.

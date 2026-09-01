@@ -30,6 +30,11 @@ from vllm.v1.core.hotprefix import (
     PromotionState,
     make_hotprefix_namespace,
 )
+from vllm.v1.core.hotprefix_observability import (
+    HotPrefixAction,
+    HotPrefixReason,
+    HotPrefixStage,
+)
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
@@ -174,6 +179,47 @@ def test_block_pool_uses_configured_selector_for_cached_free_blocks() -> None:
     assert selected[0].block_id == allocated[-1].block_id
 
 
+def test_shadow_selector_keeps_lru_order_while_tracking_priorities() -> None:
+    selector = HotPrefixBlockEvictionSelector(apply_hotprefix_priority=False)
+    pool = BlockPool(
+        num_gpu_blocks=4,
+        enable_caching=True,
+        hash_block_size=4,
+        eviction_selector=selector,
+    )
+    allocated = pool.get_new_blocks(3)
+    for index, block in enumerate(allocated):
+        block.set_block_hash(make_block_hash_with_group_id(bytes([index]), 0), 4)
+    pool.free_blocks(allocated)
+    lru_candidates = tuple(
+        block
+        for block in pool.free_block_queue.get_all_free_blocks()
+        if block.block_hash is not None
+    )
+    assert len(lru_candidates) == 3
+    selector.update_priorities(
+        {
+            lru_candidates[0].block_id: 100.0,
+            lru_candidates[1].block_id: 1.0,
+            lru_candidates[2].block_id: 0.0,
+        }
+    )
+    selector.update_groups(
+        (
+            EvictionGroup(
+                (EvictionNode(b"shadow", 10, 10),),
+                (lru_candidates[0].block_id, lru_candidates[1].block_id),
+                4,
+            ),
+        )
+    )
+
+    selected = selector.select_blocks(lru_candidates, 1)
+
+    assert selected == (lru_candidates[0].block_id,)
+    assert selector.collateral_block_ids(selected) == ()
+
+
 def test_block_pool_restores_uncached_blocks_when_selector_is_invalid() -> None:
     pool = BlockPool(
         num_gpu_blocks=5,
@@ -301,6 +347,45 @@ def test_kv_cache_manager_enables_hotprefix_without_changing_default_lru() -> No
     assert lru.block_pool.eviction_selector is None
 
 
+def test_shadow_local_projects_blocks_without_changing_lru_eviction() -> None:
+    init_none_hash(sha256)
+    group = KVCacheGroupSpec(
+        ["layer"],
+        FullAttentionSpec(
+            block_size=4,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+        ),
+    )
+    manager = KVCacheManager(
+        KVCacheConfig(
+            num_blocks=8,
+            kv_cache_tensors=[],
+            kv_cache_groups=[group],
+            prefix_cache_eviction_policy="hotprefix",
+            hotprefix_num_buckets=8,
+            hotprefix_experiment_preset="ablation_shadow_local",
+        ),
+        max_model_len=32,
+        scheduler_block_size=4,
+        hash_block_size=4,
+    )
+
+    assert manager.hotprefix_eviction_selector is not None
+    assert manager.block_pool.eviction_selector is manager.hotprefix_eviction_selector
+    request = Request(
+        "shadow",
+        [1, 2, 3, 4],
+        SamplingParams(max_tokens=1),
+        None,
+        block_hasher=get_request_block_hasher(4, sha256),
+    )
+    assert manager.allocate_slots(request, num_new_tokens=4) is not None
+    manager.free(request)
+    assert manager.hotprefix_eviction_selector.eviction_groups()
+
+
 def test_hotprefix_promotion_keeps_one_transfer_worth_of_decode_headroom() -> None:
     group = KVCacheGroupSpec(
         ["layer"],
@@ -322,6 +407,7 @@ def test_hotprefix_promotion_keeps_one_transfer_worth_of_decode_headroom() -> No
         max_model_len=32,
         scheduler_block_size=4,
         hash_block_size=4,
+        log_stats=True,
     )
     occupied = manager.block_pool.get_new_blocks(3)
     page_size = group.kv_cache_spec.page_size_bytes
@@ -334,6 +420,15 @@ def test_hotprefix_promotion_keeps_one_transfer_worth_of_decode_headroom() -> No
             min_free_blocks=0,
         )
         is None
+    )
+    rejected = manager.make_hotprefix_stats()
+    assert (
+        rejected.decision_count(
+            HotPrefixStage.PROMOTION,
+            HotPrefixAction.REJECT,
+            HotPrefixReason.HEADROOM,
+        )
+        == 1
     )
 
     manager.block_pool.free_blocks(occupied)
