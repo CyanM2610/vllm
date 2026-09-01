@@ -87,3 +87,8 @@ Configure them with `--hotprefix-experiment-preset` together with
 `--prefix-cache-eviction-policy hotprefix`. Combining a preset with `lru` is
 rejected at startup; native LRU is the P0 experiment baseline and uses no
 preset.
+
+STORE admission and promotion size a physical block as the per-layer page size
+multiplied by the number of layers in its cache group. Using the per-layer page
+alone undercounts Host capacity and transfer headroom for ordinary multi-layer
+models.
