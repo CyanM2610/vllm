@@ -213,12 +213,18 @@ class KVCacheManager:
         self.hotprefix_eviction_selector: HotPrefixBlockEvictionSelector | None = None
         self.hotprefix_promotion_manager: PromotionManager | None = None
         self._hotprefix_block_size = scheduler_block_size
+        self._hotprefix_page_size_bytes = 0
         self.hotprefix_hash_block_size = hash_block_size
         if self.hotprefix_capabilities.shadow_local:
             if not enable_caching:
                 raise ValueError("hotprefix eviction requires prefix caching")
             if len(kv_cache_config.kv_cache_groups) != 1:
                 raise ValueError("hotprefix currently requires one KV cache group")
+            hotprefix_group = kv_cache_config.kv_cache_groups[0]
+            self._hotprefix_page_size_bytes = (
+                len(hotprefix_group.layer_names)
+                * hotprefix_group.kv_cache_spec.page_size_bytes
+            )
             self._hotprefix_hotness_store = CuckooHotnessStore(
                 num_buckets=kv_cache_config.hotprefix_num_buckets
             )
@@ -1001,9 +1007,7 @@ class KVCacheManager:
         }
         free_blocks_before = len(free_ids)
         deferred_groups = selector.deferred_groups()
-        page_size_bytes = self.kv_cache_config.kv_cache_groups[
-            0
-        ].kv_cache_spec.page_size_bytes
+        page_size_bytes = self._hotprefix_page_size_bytes
         for group in deferred_groups:
             nodes = sorted(
                 (
@@ -1127,9 +1131,7 @@ class KVCacheManager:
                 free_blocks_before,
             )
             return None
-        page_size_bytes = self.kv_cache_config.kv_cache_groups[
-            0
-        ].kv_cache_spec.page_size_bytes
+        page_size_bytes = self._hotprefix_page_size_bytes
         if total_bytes != num_blocks * page_size_bytes:
             self._record_promotion_rejection(
                 HotPrefixReason.INVALID,
