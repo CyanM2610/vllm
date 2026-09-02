@@ -5,17 +5,27 @@ import random
 
 import pytest
 
+import vllm.v1.core.hotprefix_projection as projection_module
+from vllm.sampling_params import SamplingParams
+from vllm.utils.hashing import sha256
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.hotprefix import (
     EvictionGroup,
     EvictionNode,
     ExactHotnessStore,
     HotnessRecord,
     HotPrefixBlockEvictionSelector,
+    HotPrefixEvictionDeferred,
     HotPrefixNodeSnapshot,
     LocalHotPrefixTree,
 )
 from vllm.v1.core.hotprefix_projection import HotPrefixBlockProjection
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    get_request_block_hasher,
+    init_none_hash,
+)
+from vllm.v1.request import Request
 
 pytestmark = pytest.mark.cpu_test
 
@@ -123,6 +133,214 @@ def test_identical_projection_signature_skips_group_rebuild() -> None:
     assert [group.block_ids for group in selector.eviction_groups()] == [(10,)]
 
 
+def test_projection_component_size_excludes_unrelated_selector_groups() -> None:
+    selector = HotPrefixBlockEvictionSelector(defer_for_host=False)
+    selector.update_groups(
+        (
+            EvictionGroup(
+                nodes=(EvictionNode(b"unrelated", 1, 1),),
+                block_ids=tuple(range(100, 120)),
+                block_size=4,
+            ),
+        )
+    )
+    projection = HotPrefixBlockProjection(selector)
+    path = (
+        HotPrefixNodeSnapshot(
+            prefix_id=b"target",
+            full_prefix=(1, 2, 3, 4),
+            segment=(1, 2, 3, 4),
+            parent=None,
+            children=(),
+            record=HotnessRecord(frequency=3, clock=8, depth=1),
+        ),
+    )
+
+    result = projection.reconcile(
+        namespace=b"model\0tenant",
+        cached_tokens=4,
+        path=path,
+        physical_block_ids=(10,),
+        block_size=4,
+        aging_epoch=0,
+    )
+
+    assert result.max_component_blocks == 1
+
+
+def test_projection_discard_uses_block_reverse_index() -> None:
+    selector = HotPrefixBlockEvictionSelector(defer_for_host=False)
+    projection = HotPrefixBlockProjection(selector)
+    path = (
+        HotPrefixNodeSnapshot(
+            prefix_id=b"target",
+            full_prefix=(1, 2, 3, 4),
+            segment=(1, 2, 3, 4),
+            parent=None,
+            children=(),
+            record=HotnessRecord(frequency=3, clock=8, depth=1),
+        ),
+    )
+    for index in range(32):
+        projection.reconcile(
+            namespace=f"namespace-{index}".encode(),
+            cached_tokens=4,
+            path=path,
+            physical_block_ids=(100 + index,),
+            block_size=4,
+            aging_epoch=0,
+        )
+
+    result = projection.discard((110,))
+
+    assert result.invalidated_signatures == 1
+    assert result.signature_keys_examined == 1
+
+
+def test_projection_off_mode_skips_discard_timing_and_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selector = HotPrefixBlockEvictionSelector(defer_for_host=False)
+    projection = HotPrefixBlockProjection(selector, collect_work=False)
+    path = (
+        HotPrefixNodeSnapshot(
+            prefix_id=b"target",
+            full_prefix=(1, 2, 3, 4),
+            segment=(1, 2, 3, 4),
+            parent=None,
+            children=(),
+            record=HotnessRecord(frequency=3, clock=8, depth=1),
+        ),
+    )
+    assert (
+        projection.reconcile(
+            namespace=b"namespace",
+            cached_tokens=4,
+            path=path,
+            physical_block_ids=(10,),
+            block_size=4,
+            aging_epoch=0,
+        )
+        is None
+    )
+
+    def fail_timing() -> int:
+        raise AssertionError("off mode must not time discard normalization")
+
+    monkeypatch.setattr(projection_module.time, "monotonic_ns", fail_timing)
+
+    assert projection.discard((10,)) is None
+
+
+def test_overlap_merge_preserves_pending_and_terminal_group_state() -> None:
+    def group(prefix_id: bytes, block_ids: tuple[int, ...]) -> EvictionGroup:
+        return EvictionGroup(
+            nodes=(EvictionNode(prefix_id, 1, 1),),
+            block_ids=block_ids,
+            block_size=4,
+        )
+
+    pending = HotPrefixBlockEvictionSelector()
+    pending.update_groups((group(b"a", (1, 2)),))
+    pending.mark_group_pending((1, 2))
+    pending.update_groups((group(b"b", (2, 3)),))
+    candidates = tuple(KVCacheBlock(block_id) for block_id in (1, 2, 3))
+
+    with pytest.raises(HotPrefixEvictionDeferred):
+        pending.select_blocks(candidates, 1)
+    assert pending.deferred_groups() == ()
+
+    terminal = HotPrefixBlockEvictionSelector()
+    terminal.update_groups((group(b"a", (1, 2)),))
+    terminal.mark_group_terminal((1, 2))
+    terminal.update_groups((group(b"b", (2, 3)),))
+
+    assert terminal.select_blocks(candidates, 2) == (1, 2)
+
+
+def test_store_deferred_pending_terminal_preserves_multi_victim_order() -> None:
+    selector = HotPrefixBlockEvictionSelector()
+    selector.update_groups(
+        (
+            EvictionGroup(
+                nodes=(EvictionNode(b"cold", 1, 0),),
+                block_ids=(1, 2),
+                block_size=4,
+            ),
+        )
+    )
+    selector.update_priorities({3: 100.0})
+    candidates = tuple(KVCacheBlock(block_id) for block_id in (1, 2, 3))
+
+    with pytest.raises(HotPrefixEvictionDeferred):
+        selector.select_blocks(candidates, 2)
+    assert [group.block_ids for group in selector.deferred_groups()] == [(1, 2)]
+
+    selector.mark_group_pending((1, 2))
+    with pytest.raises(HotPrefixEvictionDeferred):
+        selector.select_blocks(candidates, 2)
+    assert selector.deferred_groups() == ()
+
+    selector.mark_group_terminal((1, 2))
+    assert selector.select_blocks(candidates, 2) == (1, 2)
+
+
+def test_block_pool_evict_invalidates_projection_signature() -> None:
+    init_none_hash(sha256)
+    selector = HotPrefixBlockEvictionSelector(defer_for_host=False)
+    projection = HotPrefixBlockProjection(selector)
+    selector.set_discard_observer(projection.discard)
+    pool = BlockPool(
+        num_gpu_blocks=3,
+        enable_caching=True,
+        hash_block_size=4,
+        eviction_selector=selector,
+    )
+    request = Request(
+        "block-pool-discard",
+        [1, 2, 3, 4],
+        SamplingParams(max_tokens=1),
+        None,
+        block_hasher=get_request_block_hasher(4, sha256),
+    )
+    block = pool.get_new_blocks(1)[0]
+    pool.cache_full_blocks(request, [block], 0, 1, 4, 0)
+    pool.free_blocks([block])
+    path = (
+        HotPrefixNodeSnapshot(
+            prefix_id=b"target",
+            full_prefix=(1, 2, 3, 4),
+            segment=(1, 2, 3, 4),
+            parent=None,
+            children=(),
+            record=HotnessRecord(frequency=3, clock=8, depth=1),
+        ),
+    )
+    first = projection.reconcile(
+        namespace=b"namespace",
+        cached_tokens=4,
+        path=path,
+        physical_block_ids=(block.block_id,),
+        block_size=4,
+        aging_epoch=0,
+    )
+    assert first is not None and not first.skipped
+
+    pool.evict_blocks({block.block_id})
+    second = projection.reconcile(
+        namespace=b"namespace",
+        cached_tokens=4,
+        path=path,
+        physical_block_ids=(block.block_id,),
+        block_size=4,
+        aging_epoch=0,
+    )
+
+    assert second is not None and not second.skipped
+    assert second.discard_calls == 1
+    assert second.invalidated_signatures == 1
+
+
 def test_phase_a_matches_slow_projection_across_state_changes() -> None:
     tree = LocalHotPrefixTree(
         hotness_store=ExactHotnessStore(),
@@ -149,9 +367,10 @@ def test_phase_a_matches_slow_projection_across_state_changes() -> None:
         )
         assert _group_facts(fast_selector) == _group_facts(slow)
         candidates = tuple(KVCacheBlock(block_id) for block_id in sorted(block_ids))
-        assert fast_selector.select_blocks(candidates, 1) == slow.select_blocks(
-            candidates, 1
-        )
+        for requested in range(1, min(3, len(candidates)) + 1):
+            assert fast_selector.select_blocks(
+                candidates, requested
+            ) == slow.select_blocks(candidates, requested)
         for block_id in block_ids:
             assert fast_selector.collateral_block_ids(
                 (block_id,)

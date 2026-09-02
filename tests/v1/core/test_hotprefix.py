@@ -557,6 +557,37 @@ def test_hotprefix_promotion_keeps_one_transfer_worth_of_decode_headroom() -> No
     )
 
 
+def test_hotprefix_records_promotion_candidates_once_per_planning_step() -> None:
+    group = KVCacheGroupSpec(
+        ["layer"],
+        FullAttentionSpec(
+            block_size=4,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+        ),
+    )
+    manager = KVCacheManager(
+        KVCacheConfig(
+            num_blocks=8,
+            kv_cache_tensors=[],
+            kv_cache_groups=[group],
+            prefix_cache_eviction_policy="hotprefix",
+            hotprefix_num_buckets=8,
+            hotprefix_observability_mode="aggregate",
+        ),
+        max_model_len=32,
+        scheduler_block_size=4,
+        hash_block_size=4,
+    )
+
+    manager.record_hotprefix_promotion_candidates(3)
+    stats = manager.make_hotprefix_stats()
+
+    assert stats.work["planning_steps"] == 1
+    assert stats.work["candidates"] == 3
+
+
 def test_hotprefix_sizes_physical_blocks_across_all_layers() -> None:
     group = KVCacheGroupSpec(
         ["layer-0", "layer-1", "layer-2"],
@@ -581,6 +612,7 @@ def test_hotprefix_sizes_physical_blocks_across_all_layers() -> None:
     )
     num_blocks = 2
     physical_block_bytes = len(group.layer_names) * group.kv_cache_spec.page_size_bytes
+    free_before = manager.block_pool.get_num_free_blocks()
 
     transaction = manager.reserve_hotprefix_promotion(
         prefix_id=b"multi-layer",
@@ -592,6 +624,9 @@ def test_hotprefix_sizes_physical_blocks_across_all_layers() -> None:
     assert transaction is not None
     assert transaction.total_bytes == num_blocks * physical_block_bytes
     manager.fail_hotprefix_promotion(b"multi-layer")
+    assert manager.block_pool.get_num_free_blocks() == free_before
+    assert manager.hotprefix_promotion_manager is not None
+    assert manager.hotprefix_promotion_manager.get(b"multi-layer") is None
 
 
 def test_local_hotprefix_namespaces_match_lmcache_and_isolate_cache_salts() -> None:

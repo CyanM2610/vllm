@@ -34,6 +34,11 @@ def test_collector_drains_delta_and_resets() -> None:
         request_blocks=4,
         groups=2,
         component_blocks=3,
+        discard_calls=1,
+        signature_keys=2,
+        invalidated_signatures=1,
+        planning_steps=1,
+        candidates=3,
         free_blocks_before=3,
         free_blocks_after=3,
     )
@@ -61,6 +66,11 @@ def test_collector_drains_delta_and_resets() -> None:
         "request_blocks": 8,
         "groups": 4,
         "component_blocks": 6,
+        "discard_calls": 2,
+        "signature_keys": 4,
+        "invalidated_signatures": 2,
+        "planning_steps": 2,
+        "candidates": 6,
     }
     assert second.is_empty
 

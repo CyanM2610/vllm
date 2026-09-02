@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -28,9 +29,24 @@ class ProjectionResult:
     projected_blocks: int
     groups_rebuilt: int
     max_component_blocks: int
+    discard_calls: int
+    discarded_blocks: int
+    discard_signature_keys_examined: int
+    invalidated_signatures: int
+    discard_duration_ns: int
     topology_changed: bool
     hotness_changed: bool
     binding_changed: bool
+
+
+@dataclass(frozen=True)
+class ProjectionDiscardResult:
+    """Bounded reverse-index work performed by one discard."""
+
+    discarded_blocks: int
+    signature_keys_examined: int
+    invalidated_signatures: int
+    duration_ns: int
 
 
 @dataclass(frozen=True)
@@ -45,9 +61,21 @@ class _ProjectionSignature:
 class HotPrefixBlockProjection:
     """Hide projection signatures, arithmetic block mapping, and invalidation."""
 
-    def __init__(self, selector: HotPrefixBlockEvictionSelector) -> None:
+    def __init__(
+        self,
+        selector: HotPrefixBlockEvictionSelector,
+        *,
+        collect_work: bool = True,
+    ) -> None:
         self._selector = selector
+        self._collect_work = collect_work
         self._signatures: dict[tuple[bytes, bytes], _ProjectionSignature] = {}
+        self._signature_keys_by_block: dict[int, set[tuple[bytes, bytes]]] = {}
+        self._discard_calls = 0
+        self._discarded_blocks = 0
+        self._discard_signature_keys_examined = 0
+        self._invalidated_signatures = 0
+        self._discard_duration_ns = 0
 
     def reconcile(
         self,
@@ -59,7 +87,7 @@ class HotPrefixBlockProjection:
         block_size: int,
         aging_epoch: int,
         total_tree_nodes: int | None = None,
-    ) -> ProjectionResult:
+    ) -> ProjectionResult | None:
         """Project one immutable radix path and update the eviction selector.
 
         Args:
@@ -104,6 +132,9 @@ class HotPrefixBlockProjection:
         previous = self._signatures.get(signature_key)
         tree_nodes = len(nodes) if total_tree_nodes is None else total_tree_nodes
         if signature == previous:
+            if not self._collect_work:
+                return None
+            discard_work = self._take_discard_work()
             return ProjectionResult(
                 skipped=True,
                 reason="identical",
@@ -113,6 +144,11 @@ class HotPrefixBlockProjection:
                 projected_blocks=0,
                 groups_rebuilt=0,
                 max_component_blocks=0,
+                discard_calls=discard_work[0],
+                discarded_blocks=discard_work[1],
+                discard_signature_keys_examined=discard_work[2],
+                invalidated_signatures=discard_work[3],
+                discard_duration_ns=discard_work[4],
                 topology_changed=False,
                 hotness_changed=False,
                 binding_changed=False,
@@ -141,9 +177,14 @@ class HotPrefixBlockProjection:
             physical_block_ids=blocks,
             block_size=block_size,
         )
-        self._selector.update_groups(groups)
-        components = self._selector.eviction_groups()
+        update = self._selector.update_groups(groups)
+        if previous is not None:
+            self._remove_signature_index(signature_key, previous)
         self._signatures[signature_key] = signature
+        self._add_signature_index(signature_key, signature)
+        if not self._collect_work:
+            return None
+        discard_work = self._take_discard_work()
         return ProjectionResult(
             skipped=False,
             reason=reason,
@@ -152,34 +193,91 @@ class HotPrefixBlockProjection:
             request_blocks=len(blocks),
             projected_blocks=sum(len(group.block_ids) for group in groups),
             groups_rebuilt=len(groups),
-            max_component_blocks=max(
-                (len(group.block_ids) for group in components), default=0
-            ),
+            max_component_blocks=update.max_component_blocks,
+            discard_calls=discard_work[0],
+            discarded_blocks=discard_work[1],
+            discard_signature_keys_examined=discard_work[2],
+            invalidated_signatures=discard_work[3],
+            discard_duration_ns=discard_work[4],
             topology_changed=topology_changed,
             hotness_changed=hotness_changed,
             binding_changed=binding_changed,
         )
 
-    def discard(self, block_ids: Sequence[int]) -> None:
+    def discard(self, block_ids: Sequence[int]) -> ProjectionDiscardResult | None:
         """Invalidate signatures affected by discarded physical bindings.
 
         Args:
             block_ids: Physical bindings removed by BlockPool.
         """
+        started_ns = time.monotonic_ns() if self._collect_work else 0
         discarded = set(block_ids)
-        self._signatures = {
-            signature_key: signature
-            for signature_key, signature in self._signatures.items()
-            if discarded.isdisjoint(
-                block_id
-                for block_id in signature.physical_block_ids
-                if block_id is not None
-            )
-        }
+        affected_keys: set[tuple[bytes, bytes]] = set()
+        for block_id in discarded:
+            affected_keys.update(self._signature_keys_by_block.pop(block_id, ()))
+        for signature_key in affected_keys:
+            signature = self._signatures.pop(signature_key, None)
+            if signature is not None:
+                self._remove_signature_index(signature_key, signature)
+        if not self._collect_work:
+            return None
+        result = ProjectionDiscardResult(
+            discarded_blocks=len(discarded),
+            signature_keys_examined=len(affected_keys),
+            invalidated_signatures=len(affected_keys),
+            duration_ns=time.monotonic_ns() - started_ns,
+        )
+        self._discard_calls += 1
+        self._discarded_blocks += result.discarded_blocks
+        self._discard_signature_keys_examined += result.signature_keys_examined
+        self._invalidated_signatures += result.invalidated_signatures
+        self._discard_duration_ns += result.duration_ns
+        return result
 
     def age(self) -> None:
         """Age selector priorities; tree epochs invalidate reconciliation."""
         self._selector.age_all()
+
+    def _add_signature_index(
+        self,
+        signature_key: tuple[bytes, bytes],
+        signature: _ProjectionSignature,
+    ) -> None:
+        for block_id in signature.physical_block_ids:
+            if block_id is not None:
+                self._signature_keys_by_block.setdefault(block_id, set()).add(
+                    signature_key
+                )
+
+    def _remove_signature_index(
+        self,
+        signature_key: tuple[bytes, bytes],
+        signature: _ProjectionSignature,
+    ) -> None:
+        for block_id in signature.physical_block_ids:
+            if block_id is None:
+                continue
+            signature_keys = self._signature_keys_by_block.get(block_id)
+            if signature_keys is None:
+                continue
+            signature_keys.discard(signature_key)
+            if not signature_keys:
+                self._signature_keys_by_block.pop(block_id, None)
+
+    def _take_discard_work(self) -> tuple[int, int, int, int, int]:
+        result = (
+            self._discard_calls,
+            self._discarded_blocks,
+            self._discard_signature_keys_examined,
+            self._invalidated_signatures,
+            self._discard_duration_ns,
+        )
+        self._discard_calls = 0
+        self._discarded_blocks = 0
+        self._discard_signature_keys_examined = 0
+        self._invalidated_signatures = 0
+        self._discard_duration_ns = 0
+        return result
 
     @staticmethod
     def _build_groups(
