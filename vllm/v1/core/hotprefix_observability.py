@@ -27,6 +27,7 @@ class HotPrefixStage(str, Enum):
 
     LOCAL_TREE = "local_tree"
     PROJECTION = "projection"
+    PROJECTION_DISCARD = "projection_discard"
     EVICTION = "eviction"
     CONTROL = "control"
     STORE = "store"
@@ -51,6 +52,7 @@ class HotPrefixAction(str, Enum):
     FAIL = "fail"
     COALESCE = "coalesce"
     SKIP = "skip"
+    DISCARD = "discard"
 
 
 class HotPrefixOutcome(str, Enum):
@@ -102,6 +104,11 @@ class HotPrefixObservation:
     request_blocks: int = 0
     groups: int = 0
     component_blocks: int = 0
+    discard_calls: int = 0
+    signature_keys: int = 0
+    invalidated_signatures: int = 0
+    planning_steps: int = 0
+    candidates: int = 0
     request_id: str | None = None
     prefix_digest: str | None = None
     free_blocks_before: int | None = None
@@ -120,6 +127,11 @@ class HotPrefixObservation:
             "request_blocks",
             "groups",
             "component_blocks",
+            "discard_calls",
+            "signature_keys",
+            "invalidated_signatures",
+            "planning_steps",
+            "candidates",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be non-negative")
@@ -153,6 +165,11 @@ class HotPrefixStatEntry:
     request_blocks: int
     groups: int
     component_blocks: int
+    discard_calls: int
+    signature_keys: int
+    invalidated_signatures: int
+    planning_steps: int
+    candidates: int
     free_blocks_before: int | None
     free_blocks_after: int | None
 
@@ -186,6 +203,13 @@ class HotPrefixStats:
             "request_blocks": sum(entry.request_blocks for entry in self.entries),
             "groups": sum(entry.groups for entry in self.entries),
             "component_blocks": sum(entry.component_blocks for entry in self.entries),
+            "discard_calls": sum(entry.discard_calls for entry in self.entries),
+            "signature_keys": sum(entry.signature_keys for entry in self.entries),
+            "invalidated_signatures": sum(
+                entry.invalidated_signatures for entry in self.entries
+            ),
+            "planning_steps": sum(entry.planning_steps for entry in self.entries),
+            "candidates": sum(entry.candidates for entry in self.entries),
         }
 
     def decision_count(
@@ -233,6 +257,11 @@ class HotPrefixStats:
                     "request_blocks": entry.request_blocks,
                     "groups": entry.groups,
                     "component_blocks": entry.component_blocks,
+                    "discard_calls": entry.discard_calls,
+                    "signature_keys": entry.signature_keys,
+                    "invalidated_signatures": entry.invalidated_signatures,
+                    "planning_steps": entry.planning_steps,
+                    "candidates": entry.candidates,
                     "free_blocks_before": entry.free_blocks_before,
                     "free_blocks_after": entry.free_blocks_after,
                 }
@@ -264,6 +293,11 @@ class _MutableStatEntry:
     request_blocks: int = 0
     groups: int = 0
     component_blocks: int = 0
+    discard_calls: int = 0
+    signature_keys: int = 0
+    invalidated_signatures: int = 0
+    planning_steps: int = 0
+    candidates: int = 0
     free_blocks_before: int | None = None
     free_blocks_after: int | None = None
 
@@ -316,6 +350,11 @@ class InMemoryHotPrefixObservationCollector:
             entry.request_blocks += event.request_blocks
             entry.groups += event.groups
             entry.component_blocks += event.component_blocks
+            entry.discard_calls += event.discard_calls
+            entry.signature_keys += event.signature_keys
+            entry.invalidated_signatures += event.invalidated_signatures
+            entry.planning_steps += event.planning_steps
+            entry.candidates += event.candidates
             if event.free_blocks_before is not None:
                 entry.free_blocks_before = event.free_blocks_before
             if event.free_blocks_after is not None:
@@ -335,6 +374,11 @@ class InMemoryHotPrefixObservationCollector:
                 "hotprefix.request_blocks": event.request_blocks,
                 "hotprefix.groups": event.groups,
                 "hotprefix.component_blocks": event.component_blocks,
+                "hotprefix.discard_calls": event.discard_calls,
+                "hotprefix.signature_keys": event.signature_keys,
+                "hotprefix.invalidated_signatures": event.invalidated_signatures,
+                "hotprefix.planning_steps": event.planning_steps,
+                "hotprefix.candidates": event.candidates,
                 "hotprefix.duration_ns": event.duration_ns,
             }
             if self._run_id:
@@ -379,6 +423,11 @@ class InMemoryHotPrefixObservationCollector:
                 request_blocks=value.request_blocks,
                 groups=value.groups,
                 component_blocks=value.component_blocks,
+                discard_calls=value.discard_calls,
+                signature_keys=value.signature_keys,
+                invalidated_signatures=value.invalidated_signatures,
+                planning_steps=value.planning_steps,
+                candidates=value.candidates,
                 free_blocks_before=value.free_blocks_before,
                 free_blocks_after=value.free_blocks_after,
             )

@@ -662,6 +662,11 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             documentation="Normalized work observed by HotPrefix projection.",
             labelnames=labelnames + ["dimension"],
         )
+        self.counter_hotprefix_projection_discards = self._counter_cls(
+            name="vllm:hotprefix_projection_discards",
+            documentation="Projection binding discard calls and affected work.",
+            labelnames=labelnames + ["outcome"],
+        )
         self.counter_hotprefix_promotion_bytes = self._counter_cls(
             name="vllm:hotprefix_promotion_bytes",
             documentation="HotPrefix promotion bytes split by lifecycle phase.",
@@ -676,6 +681,16 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             name="vllm:hotprefix_promotion_attempts",
             documentation="Promotion reservation attempts by outcome and reason.",
             labelnames=labelnames + ["outcome", "reason"],
+        )
+        self.counter_hotprefix_promotion_planning_steps = self._counter_cls(
+            name="vllm:hotprefix_promotion_planning_steps",
+            documentation="Scheduler steps that evaluated promotion candidates.",
+            labelnames=labelnames,
+        )
+        self.counter_hotprefix_promotion_candidates = self._counter_cls(
+            name="vllm:hotprefix_promotion_candidates",
+            documentation="Host candidates considered by promotion planning.",
+            labelnames=labelnames,
         )
         self.counter_hotprefix_promotion_backoff_skips = self._counter_cls(
             name="vllm:hotprefix_promotion_backoff_skips",
@@ -1190,6 +1205,18 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     self.counter_hotprefix_projection_work.labels(
                         *labelvalues, dimension
                     ).inc(int(entry.get(dimension, 0)))
+            elif stage == "projection_discard":
+                self.counter_hotprefix_projection_discards.labels(
+                    *labelvalues, outcome
+                ).inc(int(entry.get("discard_calls", 0)))
+                for dimension in (
+                    "blocks",
+                    "signature_keys",
+                    "invalidated_signatures",
+                ):
+                    self.counter_hotprefix_projection_work.labels(
+                        *labelvalues, f"discard_{dimension}"
+                    ).inc(int(entry.get(dimension, 0)))
             if kind == "promotion" and int(entry["bytes"]) > 0:
                 self.counter_hotprefix_promotion_bytes.labels(
                     *labelvalues, action, outcome
@@ -1199,7 +1226,14 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     *labelvalues, reason
                 ).inc(count)
             if kind == "decision" and stage == "promotion":
-                if action in {"reject", "reserve"}:
+                if action == "plan":
+                    self.counter_hotprefix_promotion_planning_steps.labels(
+                        *labelvalues
+                    ).inc(int(entry.get("planning_steps", 0)))
+                    self.counter_hotprefix_promotion_candidates.labels(
+                        *labelvalues
+                    ).inc(int(entry.get("candidates", 0)))
+                elif action in {"reject", "reserve"}:
                     self.counter_hotprefix_promotion_attempts.labels(
                         *labelvalues, outcome, reason
                     ).inc(count)

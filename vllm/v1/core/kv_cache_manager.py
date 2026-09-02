@@ -253,7 +253,8 @@ class KVCacheManager:
             )
             self.block_pool.eviction_selector = self.hotprefix_eviction_selector
             self.hotprefix_projection = HotPrefixBlockProjection(
-                self.hotprefix_eviction_selector
+                self.hotprefix_eviction_selector,
+                collect_work=self._hotprefix_observability_enabled,
             )
             self.hotprefix_eviction_selector.set_discard_observer(
                 self.hotprefix_projection.discard
@@ -996,6 +997,22 @@ class KVCacheManager:
             total_tree_nodes=tree.node_count,
         )
         if self._hotprefix_observability_enabled:
+            assert result is not None
+            if result.discard_calls:
+                self.hotprefix_observations.record(
+                    HotPrefixObservation(
+                        kind=HotPrefixEventKind.CPU,
+                        stage=HotPrefixStage.PROJECTION_DISCARD,
+                        action=HotPrefixAction.DISCARD,
+                        outcome=HotPrefixOutcome.SUCCESS,
+                        reason=HotPrefixReason.BINDING_CHANGED,
+                        duration_ns=result.discard_duration_ns,
+                        blocks=result.discarded_blocks,
+                        discard_calls=result.discard_calls,
+                        signature_keys=result.discard_signature_keys_examined,
+                        invalidated_signatures=result.invalidated_signatures,
+                    )
+                )
             projection_reason = {
                 "identical": HotPrefixReason.IDENTICAL,
                 "topology": HotPrefixReason.TOPOLOGY_CHANGED,
@@ -1270,6 +1287,30 @@ class KVCacheManager:
                 )
             )
         return transaction
+
+    def record_hotprefix_promotion_candidates(self, candidates: int) -> None:
+        """Record one scheduler planning step and its candidate count.
+
+        Args:
+            candidates: Feasible Host candidates considered this step.
+
+        Raises:
+            ValueError: If ``candidates`` is negative.
+        """
+        if candidates < 0:
+            raise ValueError("promotion candidate count must be non-negative")
+        if not self._hotprefix_observability_enabled:
+            return
+        self.hotprefix_observations.record(
+            HotPrefixObservation(
+                kind=HotPrefixEventKind.DECISION,
+                stage=HotPrefixStage.PROMOTION,
+                action=HotPrefixAction.PLAN,
+                outcome=HotPrefixOutcome.SUCCESS,
+                planning_steps=1,
+                candidates=candidates,
+            )
+        )
 
     def publish_hotprefix_promotion(
         self,

@@ -502,6 +502,14 @@ class EvictionGroup:
 
 
 @dataclass(frozen=True)
+class EvictionGroupUpdate:
+    """Affected connected-component work from one selector update."""
+
+    groups_updated: int = 0
+    max_component_blocks: int = 0
+
+
+@dataclass(frozen=True)
 class EvictionStoreCandidate:
     """Pinned full-prefix HBM source for one selective Host STORE."""
 
@@ -539,7 +547,7 @@ class HotPrefixBlockEvictionSelector:
         self._pending_group_keys: set[frozenset[int]] = set()
         self._terminal_group_keys: set[frozenset[int]] = set()
         self._deferred_group_keys: set[frozenset[int]] = set()
-        self._discard_observer: Callable[[Sequence[int]], None] | None = None
+        self._discard_observer: Callable[[Sequence[int]], object] | None = None
         self._state_epoch = 0
 
     @property
@@ -547,7 +555,7 @@ class HotPrefixBlockEvictionSelector:
         """Return the monotonic projection/group feasibility epoch."""
         return self._state_epoch
 
-    def set_discard_observer(self, observer: Callable[[Sequence[int]], None]) -> None:
+    def set_discard_observer(self, observer: Callable[[Sequence[int]], object]) -> None:
         """Notify projection state whenever physical bindings are discarded.
 
         Args:
@@ -567,7 +575,7 @@ class HotPrefixBlockEvictionSelector:
         if priorities:
             self._state_epoch += 1
 
-    def update_groups(self, groups: Sequence[EvictionGroup]) -> None:
+    def update_groups(self, groups: Sequence[EvictionGroup]) -> EvictionGroupUpdate:
         """Merge block-overlapping logical groups and publish their priorities.
 
         A token-level radix boundary can fall inside a physical block.  Such
@@ -575,11 +583,17 @@ class HotPrefixBlockEvictionSelector:
         one connected component and every block receives the component score.
         """
         changed = False
+        groups_updated = 0
+        max_component_blocks = 0
         for incoming in groups:
             changed = True
+            groups_updated += 1
             nodes = {node.prefix_id: node for node in incoming.nodes}
             block_ids = set(incoming.block_ids)
             block_size = incoming.block_size
+            was_pending = False
+            was_terminal = False
+            was_deferred = False
             while True:
                 overlapping = {
                     id(group): group
@@ -598,6 +612,13 @@ class HotPrefixBlockEvictionSelector:
                     block_ids.update(group.block_ids)
                     for node in group.nodes:
                         nodes.setdefault(node.prefix_id, node)
+                    old_key = frozenset(group.block_ids)
+                    was_pending = was_pending or old_key in self._pending_group_keys
+                    was_terminal = was_terminal or old_key in self._terminal_group_keys
+                    was_deferred = was_deferred or old_key in self._deferred_group_keys
+                    self._pending_group_keys.discard(old_key)
+                    self._terminal_group_keys.discard(old_key)
+                    self._deferred_group_keys.discard(old_key)
                     grew = grew or len(block_ids) != previous_size
                     for old_block_id in group.block_ids:
                         self._groups_by_block.pop(old_block_id, None)
@@ -611,8 +632,17 @@ class HotPrefixBlockEvictionSelector:
             for block_id in merged.block_ids:
                 self._groups_by_block[block_id] = merged
                 self._priorities[block_id] = merged.priority
+            merged_key = frozenset(merged.block_ids)
+            if was_pending:
+                self._pending_group_keys.add(merged_key)
+            elif was_terminal:
+                self._terminal_group_keys.add(merged_key)
+            elif was_deferred:
+                self._deferred_group_keys.add(merged_key)
+            max_component_blocks = max(max_component_blocks, len(merged.block_ids))
         if changed:
             self._state_epoch += 1
+        return EvictionGroupUpdate(groups_updated, max_component_blocks)
 
     def collateral_block_ids(
         self, selected_block_ids: Sequence[int]
