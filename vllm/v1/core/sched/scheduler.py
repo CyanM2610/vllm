@@ -388,6 +388,33 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
         self._init_prefill_operations()
+        self._init_native_compute_selection()
+
+    def _init_native_compute_selection(self, config=None):
+        """Opt-in compute-only policy; no independent transfer/control entry."""
+        self._native_compute_selection = None
+        if config is None:
+            path = os.environ.get("PREFILL_NATIVE_COMPUTE_CONFIG")
+            if not path:
+                return
+            import json
+            from pathlib import Path
+            config = json.loads(Path(path).read_text())
+        from vllm.v1.core.sched.global_sjf_input import frozen_config_scope
+        from vllm.v1.core.sched.native_compute import NativeComputeSelection
+        _, errors = frozen_config_scope(self.vllm_config, self.block_size)
+        extra = self.vllm_config.kv_transfer_config.kv_connector_extra_config
+        forbidden = ("global_plan", "decoupled_control", "prepare_load_operations",
+                     "prepare_lookup_operations", "lookup_independent_progress",
+                     "eager_prefetch")
+        if (errors or any(extra.get("lmcache.mp."+key, False) for key in forbidden)
+                or self._action_feedback is None
+                or getattr(self, "_global_sjf_input_enabled", False)
+                or getattr(self, "_compute_budget", None) is not None):
+            raise ValueError("native compute policy requires frozen native transfer paths: " + repr(errors))
+        model = self.vllm_config.model_config
+        self._native_compute_selection = NativeComputeSelection(
+            config, getattr(model, "hf_text_config", None) or model.hf_config)
 
     def _init_prefill_operations(self) -> None:
         config = self.vllm_config.kv_transfer_config
@@ -568,6 +595,9 @@ class Scheduler(SchedulerInterface):
         evidence = self._action_compute.pop((self.current_step, request_id), None)
         if evidence is not None:
             def revoke(feedback):
+                selection = getattr(self, "_native_compute_selection", None)
+                if selection is not None:
+                    selection.revoked(request_id)
                 if getattr(self, "_compute_budget", None) is not None:
                     self._compute_budget_revoke(request_id)
             self._action_feedback.report(
@@ -1156,6 +1186,11 @@ class Scheduler(SchedulerInterface):
             self._global_plan.matches[request.request_id] = MatchObservation(
                 num_new_local_computed_tokens, num_external_computed_tokens,
                 num_computed_tokens, time.monotonic_ns(), self.current_step)
+        selection = getattr(self, "_native_compute_selection", None)
+        if selection is not None:
+            selection.matched(request, num_new_local_computed_tokens,
+                              num_external_computed_tokens, num_computed_tokens,
+                              self.current_step)
         return PrefixMatch(
             new_computed_blocks, num_new_local_computed_tokens,
             num_external_computed_tokens, num_computed_tokens, load_kv_async,
@@ -1275,7 +1310,11 @@ class Scheduler(SchedulerInterface):
         # First, schedule the RUNNING requests.
         sjf_order = getattr(self, "_global_sjf_input_enabled", False)
         explicit_plan = plan_runtime is not None
-        global_order = sjf_order or explicit_plan
+        compute_selection = getattr(self, "_native_compute_selection", None)
+        compute_order = compute_selection is not None and compute_selection.mode != "native"
+        if compute_selection is not None:
+            compute_selection.begin(self, token_budget, input_budget)
+        global_order = sjf_order or explicit_plan or compute_order
         step_skipped_waiting = create_request_queue(self.policy)
         action_feedback = getattr(self, "_action_feedback", None) is not None
         policy_skipped = set()
@@ -1290,6 +1329,8 @@ class Scheduler(SchedulerInterface):
         def observe_global(request, **fields):
             if sjf_order:
                 self._global_sjf_observe_result(request, **fields)
+            elif compute_order:
+                compute_selection.observe(request, **fields)
             elif explicit_plan:
                 wait_emit("global_plan_execution", request.request_id,
                           step=self.current_step, **fields)
@@ -1544,6 +1585,14 @@ class Scheduler(SchedulerInterface):
                             compute_batch_end = True
                             return False
                         num_new_tokens = compute_grant.tokens
+                    if compute_selection is not None:
+                        proposal = compute_selection.propose(
+                            request, request.num_computed_tokens, num_new_tokens, "running")
+                        if proposal.tokens == 0:
+                            compute_batch_end = True
+                            return False
+                        num_new_tokens = proposal.tokens
+                        action_end_after_commit = proposal.end_after_commit
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
@@ -1622,6 +1671,8 @@ class Scheduler(SchedulerInterface):
             if global_order:
                 ledger.record(request, 'running', request.num_computed_tokens, num_new_tokens)
             mark(request, "running_allocated", quota=num_new_tokens)
+            if compute_selection is not None:
+                compute_selection.committed(request, request.num_computed_tokens, num_new_tokens, "running")
             if decoupled_control:
                 self._observe_operation(
                     request, "compute", "selected", request.num_computed_tokens,
@@ -1999,6 +2050,13 @@ class Scheduler(SchedulerInterface):
                     compute_batch_end = True
                     return False
                 num_new_tokens = compute_grant.tokens
+            if compute_selection is not None and not load_kv_async:
+                proposal = compute_selection.propose(request, num_computed_tokens, num_new_tokens, "waiting")
+                if proposal.tokens == 0:
+                    compute_batch_end = True
+                    return False
+                num_new_tokens = proposal.tokens
+                action_end_after_commit = proposal.end_after_commit
             new_blocks = self.kv_cache_manager.allocate_slots(
                 request,
                 num_new_tokens,
@@ -2120,6 +2178,7 @@ class Scheduler(SchedulerInterface):
             if request.status == RequestStatus.WAITING or (
                 global_order and request.request_id not in (
                     self._global_sjf_worker_initialized if sjf_order
+                    else compute_selection.reader.worker_initialized if compute_order
                     else plan_runtime.worker_initialized)
             ):
                 scheduled_new_reqs.append(request)
@@ -2133,6 +2192,8 @@ class Scheduler(SchedulerInterface):
                 request_id
             )
             mark(request, "waiting_allocated", quota=num_new_tokens, matched=num_computed_tokens)
+            if compute_selection is not None:
+                compute_selection.committed(request, num_computed_tokens, num_new_tokens, "waiting")
             if decoupled_control:
                 self._observe_operation(
                     request, "compute", "selected", num_computed_tokens,
@@ -2261,12 +2322,14 @@ class Scheduler(SchedulerInterface):
                 from vllm.v1.core.sched.global_plan import OperationKind
             if sjf_order:
                 entries = [(r, None) for r in self._global_sjf_candidates()]
+            elif compute_order:
+                entries = [(self.requests[rid], None) for rid in compute_selection.ordered_ids]
             else:
                 entries = [(self.requests[item.request_id], item) for item in plan_runtime.attempts
                            if item.request_id in self.requests]
             references = candidate_references(self, (r for r, _ in entries), unique=not explicit_plan)
             waiting_closed = self._pause_state != PauseState.UNPAUSED
-            for (request, active_branch, queue), (_, entry) in zip(references, entries):
+            for candidate_index, ((request, active_branch, queue), (_, entry)) in enumerate(zip(references, entries)):
                 rid = request.request_id
                 if request in preempted_reqs:
                     continue
@@ -2318,7 +2381,7 @@ class Scheduler(SchedulerInterface):
                         self._action_blocked(request, "compute", "restore_not_published")
                         continue
                 if compute_batch_end or token_budget <= 0 or input_budget <= draft_slots:
-                    if sjf_order:
+                    if sjf_order or compute_order:
                         break
                     observe_global(request, kind="compute", outcome="not_checked", reason="compute_selection_closed")
                     continue
@@ -2346,6 +2409,10 @@ class Scheduler(SchedulerInterface):
                     observe_global(request, outcome="allocated", branch=active_branch, quota=num_scheduled_tokens[rid], remaining_budget=token_budget)
                 elif request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                     observe_global(request, outcome="restore_pending", branch=active_branch, reason="native_remote_dependency", remaining_budget=token_budget)
+                if compute_order and compute_selection.fallback_requested:
+                    remaining = [r.request_id for r,_ in entries[candidate_index+1:]]
+                    entries[candidate_index+1:] = [(self.requests[rid],None)
+                        for rid in compute_selection.fallback_order(remaining)]
             # There is deliberately no implicit extra-LOAD or new-LOOKUP pass
             # here. Only plan items above may enter these submission paths.
             if explicit_plan:
@@ -2537,6 +2604,8 @@ class Scheduler(SchedulerInterface):
         if self.defer_block_free and total_num_scheduled_tokens > 0:
             self.sched_step_seq += 1
 
+        if compute_selection is not None:
+            compute_selection.finish(scheduler_output)
         if sjf_order:
             self._global_sjf_observe_step_end(scheduler_output)
         if plan_runtime is not None:
@@ -2983,6 +3052,9 @@ class Scheduler(SchedulerInterface):
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
         self._check_action_entry()
+        selection = getattr(self, "_native_compute_selection", None)
+        if selection is not None:
+            selection.output_received(scheduler_output)
         action_step = getattr(scheduler_output, "_action_step_id", None)
         action_results = {}
         if action_step is not None:
@@ -3627,6 +3699,9 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             if getattr(self, "_global_plan", None) is not None:
                 self._global_plan.register(request.request_id)
+            selection = getattr(self, "_native_compute_selection", None)
+            if selection is not None:
+                selection.register(request)
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.spec_decode_metrics_level != "none":

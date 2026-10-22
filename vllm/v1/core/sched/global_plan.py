@@ -46,6 +46,7 @@ class RequestCandidate:
     held_hbm_blocks: int
     dependencies: tuple[tuple[str, str], ...]
     native_lookup_fallback: str | None = None
+    restore_failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -166,28 +167,15 @@ def _operation(view, retained=False, sequence=None):
     )
 
 
-class PlanRuntime:
-    """Plan validation/accounting only. Native owners perform all side effects."""
-    def __init__(self, *, new_lookup=False, lookup_limit=32, load_limit=32):
-        self.policy = NativePlan()
+class CandidateReader:
+    """Pure scalar snapshot shared by operation plans and compute-only policies."""
+    def __init__(self):
         self.sequences = {}
         self.sequence = 0
         self.matches = {}
         self.worker_initialized = set()
-        self.snapshot = None
-        self.current = None
-        self.attempts = ()
-        self.active_item = None
-        self.new_lookup = new_lookup
-        self.lookup_limit, self.load_limit = lookup_limit, load_limit
-        self.request_views = {}
-        self.stores = {}
-        self.new_stores = {}
-        self.checked = set()
-        self.check_count = 0
-        self.check_cpu_ns = 0
-        self.check_wall_ns = 0
-        self.timings = deque(maxlen=128)
+        self.new_lookup = False
+        self.lookup_limit = self.load_limit = 0
 
     def register(self, request_id):
         self.sequence += 1
@@ -230,6 +218,7 @@ class PlanRuntime:
                     query.get("observed_ns"), self.matches.get(rid), pending_restore,
                     received, adopted, len(manager.req_to_blocks.get(rid, ())), blockers,
                     query.get("native_fallback_reason"),
+                    rid in scheduler.failed_recving_kv_req_ids,
                 ))
         operations = [_operation(v, bool(v.get("retained_store")), self.sequences.get(v["request_id"]))
                       for v in connector.get_global_operation_snapshot()]
@@ -254,6 +243,30 @@ class PlanRuntime:
             bool(connector.decoupled_store_enabled),
             self.new_lookup, self.lookup_limit, self.load_limit,
         )
+
+
+class PlanRuntime(CandidateReader):
+    """Plan validation/accounting only. Native owners perform all side effects."""
+    def __init__(self, *, new_lookup=False, lookup_limit=32, load_limit=32):
+        self.policy = NativePlan()
+        self.sequences = {}
+        self.sequence = 0
+        self.matches = {}
+        self.worker_initialized = set()
+        self.snapshot = None
+        self.current = None
+        self.attempts = ()
+        self.active_item = None
+        self.new_lookup = new_lookup
+        self.lookup_limit, self.load_limit = lookup_limit, load_limit
+        self.request_views = {}
+        self.stores = {}
+        self.new_stores = {}
+        self.checked = set()
+        self.check_count = 0
+        self.check_cpu_ns = 0
+        self.check_wall_ns = 0
+        self.timings = deque(maxlen=128)
 
     def begin(self, scheduler, token_budget, input_budget):
         # Retirement is outside the pure reader and does not hold Request refs.
