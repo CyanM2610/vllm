@@ -951,7 +951,11 @@ class Scheduler(SchedulerInterface):
         decoupled_control = getattr(self, "_decoupled_control", False)
         operations_enabled = getattr(self, "_prefill_operations_enabled", False)
         if operations_enabled:
+            control_wall, control_cpu = time.perf_counter_ns(), time.thread_time_ns()
             self._begin_prefill_operation_step()
+            wait_emit("operation_control_timing", step=self.current_step, phase="progress_adopt",
+                      wall_ns=time.perf_counter_ns()-control_wall,
+                      thread_cpu_ns=time.thread_time_ns()-control_cpu)
         conditional_end = getattr(self, "_conditional_end_enabled", False)
         conditional_stop = False
         if conditional_end:
@@ -1780,6 +1784,7 @@ class Scheduler(SchedulerInterface):
                     and self._pause_state == PauseState.UNPAUSED):
                 self._operation_budget = token_budget
                 self._operation_input_budget = input_budget
+                control_wall, control_cpu = time.perf_counter_ns(), time.thread_time_ns()
                 self._prepare_new_lookup_operations()
 
                 class RestoreCandidateReference:
@@ -1790,7 +1795,11 @@ class Scheduler(SchedulerInterface):
                         return self.request
 
                 active_branch = "restore_control"
-                for request in self._operation_candidates:
+                # This switch gates only extra admission after RUNNING.
+                # Native WAITING matching/LOAD and start-of-step adoption
+                # keep their original paths. Both modes use the same RR view.
+                for request in (self._operation_candidates
+                                if self.connector.prepare_load_operations else ()):
                     if (request.status not in (
                         RequestStatus.WAITING, RequestStatus.PREEMPTED
                     ) or request.num_computed_tokens != 0):
@@ -1803,8 +1812,16 @@ class Scheduler(SchedulerInterface):
                     )
                     if (lookup["result_known"]
                             and lookup["result_tokens"] > 0):
+                        wait_emit("extra_load_prepare_attempt", request.request_id,
+                                  step=self.current_step, remaining_budget=token_budget,
+                                  lookup_result_tokens=lookup["result_tokens"],
+                                  status=request.status.name)
                         process_waiting(RestoreCandidateReference(request),
                                         restore_only=True)
+                wait_emit("operation_control_timing", step=self.current_step, phase="extra_prepare",
+                          extra_load_enabled=self.connector.prepare_load_operations,
+                          wall_ns=time.perf_counter_ns()-control_wall,
+                          thread_cpu_ns=time.thread_time_ns()-control_cpu)
 
             if not conditional_stop and not compute_batch_end and not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
                 active_branch = "waiting"
