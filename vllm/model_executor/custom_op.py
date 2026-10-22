@@ -135,6 +135,18 @@ class CustomOp(nn.Module):
     def forward(self, *args, **kwargs):
         return self._forward_method(*args, **kwargs)
 
+    def get_dispatch_info(self) -> dict[str, str]:
+        """Describe the callable selected at construction without redispatching."""
+        method = self._forward_method
+        return {
+            "module_class": f"{type(self).__module__}.{type(self).__qualname__}",
+            "method_module": getattr(method, "__module__", type(method).__module__),
+            "method_qualname": getattr(
+                method, "__qualname__", type(method).__qualname__
+            ),
+            "callable_type": type(method).__qualname__,
+        }
+
     def forward_native(self, *args, **kwargs):
         """PyTorch-native implementation of the forward method.
         This method is optional. If implemented, it can be used with compilers
