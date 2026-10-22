@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
 
 import torch
@@ -13,6 +14,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
     ReqId,
+    TransferJob,
 )
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import (
@@ -59,6 +61,10 @@ class OffloadingConnectorWorker:
             tuple[int, GPULoadStoreSpec, LoadStoreSpec]
         ] = []
         self._connector_worker_meta = OffloadingWorkerMetadata()
+        # Optional host-submission ordering; execution and completion stay here.
+        self.submission_order: (
+            Callable[[str, tuple[int, ...]], Sequence[int]] | None
+        ) = None
 
     def _init_worker(self, kv_caches: CanonicalKVCaches) -> None:
         self.worker = self.spec.get_worker(kv_caches)
@@ -222,28 +228,51 @@ class OffloadingConnectorWorker:
                         (job_id, entry.src_spec, entry.dst_spec)
                     )
 
-        # Submit deferred stores from previous step (and jobs_to_flush above).
-        for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
-            assert isinstance(src_spec, GPULoadStoreSpec)
-            success = self.worker.submit_store(job_id, src_spec, dst_spec)
-            assert success
-        self._unsubmitted_store_jobs.clear()
+        self._submit_pending_stores()
 
         if kv_connector_metadata.jobs_to_flush:
             self.worker.wait(kv_connector_metadata.jobs_to_flush)
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
         assert self.worker is not None
-        for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
-            success = self.worker.submit_store(job_id, src_spec, dst_spec)
-            assert success
-        self._unsubmitted_store_jobs.clear()
+        self._submit_pending_stores()
 
-        for job_id, entry in metadata.load_jobs.items():
+        entries: Iterable[tuple[int, TransferJob]] = metadata.load_jobs.items()
+        if self.submission_order is not None and metadata.load_jobs:
+            jobs = dict(metadata.load_jobs)
+            ids = self._submission_ids("h2d", tuple(jobs))
+            entries = ((job_id, jobs[job_id]) for job_id in ids)
+        for job_id, entry in entries:
             self._load_jobs[job_id] = entry.req_id
             assert isinstance(entry.dst_spec, GPULoadStoreSpec)
             success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
             assert success
+
+    def _submission_ids(self, direction: str, ids: tuple[int, ...]) -> tuple[int, ...]:
+        assert self.submission_order is not None
+        if len(set(ids)) != len(ids):
+            raise ValueError("duplicate pending transfer ID")
+        ordered = tuple(self.submission_order(direction, ids))
+        if (
+            len(ordered) != len(ids)
+            or any(type(job_id) is not int for job_id in ordered)
+            or set(ordered) != set(ids)
+        ):
+            raise ValueError("submission order must be a complete ID permutation")
+        return ordered
+
+    def _submit_pending_stores(self) -> None:
+        assert self.worker is not None
+        pending = self._unsubmitted_store_jobs
+        if self.submission_order is not None and pending:
+            jobs = {entry[0]: entry for entry in pending}
+            ids = self._submission_ids("d2h", tuple(entry[0] for entry in pending))
+            pending = [jobs[job_id] for job_id in ids]
+        for job_id, src_spec, dst_spec in pending:
+            assert isinstance(src_spec, GPULoadStoreSpec)
+            success = self.worker.submit_store(job_id, src_spec, dst_spec)
+            assert success
+        self._unsubmitted_store_jobs.clear()
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():

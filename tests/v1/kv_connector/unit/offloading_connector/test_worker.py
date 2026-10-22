@@ -247,6 +247,7 @@ def test_handle_preemptions_non_writer_acks_flushed_store():
     )
     metadata = _store_metadata(10)
     metadata.jobs_to_flush = {10}
+    worker.submission_order = MagicMock(side_effect=AssertionError("no store writer"))
 
     worker.handle_preemptions(metadata)
 
@@ -257,6 +258,86 @@ def test_handle_preemptions_non_writer_acks_flushed_store():
     meta = worker.build_connector_worker_meta()
     assert meta is not None
     assert meta.completed_jobs == {10: 1}
+    worker.submission_order.assert_not_called()
+
+
+def test_submission_order_sees_merged_stores_before_flush_wait():
+    worker, _ = _make_worker(
+        KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+    )
+    calls = []
+    decisions = []
+    worker.worker.submit_store.side_effect = lambda job, *_: calls.append(job) or True
+    worker.worker.wait.side_effect = lambda jobs: calls.append(("wait", jobs))
+
+    def order(direction, ids):
+        decisions.append((direction, ids))
+        return ids[::-1]
+
+    worker.submission_order = order
+    worker.prepare_store_kv(_store_metadata(8))
+    metadata = _store_metadata(10)
+    metadata.store_jobs.update(_store_metadata(11).store_jobs)
+    metadata.jobs_to_flush = {10}
+    worker.handle_preemptions(metadata)
+
+    assert decisions == [("d2h", (8, 10))]
+    assert calls == [10, 8, ("wait", {10})]
+    assert list(metadata.store_jobs) == [11]
+    assert worker._unsubmitted_store_jobs == []
+
+
+def test_submission_order_reaches_loads_without_reordering_metadata():
+    worker, _ = _make_worker(
+        KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+    )
+    metadata = _load_metadata(80)
+    metadata.load_jobs.update(_load_metadata(11).load_jobs)
+    decisions = []
+
+    def order(direction, ids):
+        decisions.append((direction, ids))
+        return ids[::-1]
+
+    worker.submission_order = order
+    worker.start_kv_transfers(metadata)
+    worker.start_kv_transfers(_empty_metadata())
+
+    assert decisions == [("h2d", (80, 11))]
+    assert [call.args[0] for call in worker.worker.submit_load.call_args_list] == [
+        11,
+        80,
+    ]
+    assert list(metadata.load_jobs) == [80, 11]
+    assert worker._load_jobs == {11: "req", 80: "req"}
+
+
+@pytest.mark.parametrize("order", [(7,), (7, 7), (7, 99), (True, 8)])
+@pytest.mark.parametrize("direction", ["h2d", "d2h"])
+def test_invalid_submission_order_preserves_jobs_before_directional_submit(
+    order, direction
+):
+    worker, _ = _make_worker(
+        KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+    )
+    worker.submission_order = lambda *_: order
+    if direction == "d2h":
+        worker.prepare_store_kv(_store_metadata(7))
+        metadata = _store_metadata(8)
+        metadata.jobs_to_flush = {8}
+        with pytest.raises(ValueError, match="complete ID permutation"):
+            worker.handle_preemptions(metadata)
+        assert [job[0] for job in worker._unsubmitted_store_jobs] == [7, 8]
+        worker.worker.wait.assert_not_called()
+    else:
+        metadata = _load_metadata(7)
+        metadata.load_jobs.update(_load_metadata(8).load_jobs)
+        with pytest.raises(ValueError, match="complete ID permutation"):
+            worker.start_kv_transfers(metadata)
+        assert list(metadata.load_jobs) == [7, 8]
+        assert worker._load_jobs == {}
+    worker.worker.submit_store.assert_not_called()
+    worker.worker.submit_load.assert_not_called()
 
 
 def test_start_kv_transfers_non_writer_still_submits_load():
