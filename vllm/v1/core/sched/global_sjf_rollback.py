@@ -12,6 +12,35 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+class QueueView:
+    """Runtime-only single-request reference; never exposed in a snapshot."""
+    def __init__(self, queue, request):
+        self.queue, self.request = queue, request
+
+    def peek_request(self):
+        return self.request
+
+    def pop_request(self):
+        self.queue.remove_request(self.request)
+        return self.request
+
+
+def candidate_references(scheduler, ordered, *, unique=True):
+    """Shared by SJF and explicit plans; does not reorder any native owner."""
+    running = {id(r) for r in scheduler.running}
+    owners = {id(r): q for q in (scheduler.waiting, scheduler.skipped_waiting) for r in q}
+    seen = set()
+    for request in ordered:
+        if unique and id(request) in seen:
+            continue
+        seen.add(id(request))
+        if id(request) in running:
+            yield request, "running", None
+        elif id(request) in owners:
+            yield request, "waiting", owners[id(request)]
+
+
+
 @dataclass(frozen=True)
 class AllocationRecord:
     request: object

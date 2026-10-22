@@ -107,6 +107,7 @@ class OperationAction:
 
 class ResultKind(str, Enum):
     NOT_ATTEMPTED = "not_attempted"
+    NOT_REQUIRED = "not_required"
     BLOCKED = "blocked"
     RESOURCES_ACQUIRED = "resources_acquired"
     SELECTED = "compute_selected"

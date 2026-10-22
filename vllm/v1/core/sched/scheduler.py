@@ -393,6 +393,10 @@ class Scheduler(SchedulerInterface):
         config = self.vllm_config.kv_transfer_config
         extra = (config.kv_connector_extra_config or {}) if config else {}
         enabled = extra.get("lmcache.mp.action_feedback", False)
+        global_plan = extra.get("lmcache.mp.global_plan", False)
+        if type(global_plan) is not bool or (global_plan and not enabled):
+            raise ValueError("global_plan requires explicit action_feedback=true")
+        self._global_plan = None
         if type(enabled) is not bool:
             raise ValueError("lmcache.mp.action_feedback must be bool")
         self._action_feedback = None
@@ -473,6 +477,24 @@ class Scheduler(SchedulerInterface):
             self._action_native_receipts = OrderedDict()
             self._action_legacy_decider = False
             self.connector.set_operation_feedback_observer(self._connector_action_feedback)
+        if global_plan:
+            from vllm.v1.core.sched.global_plan import PlanRuntime
+            if self.connector.prepare_lookup_operations:
+                raise ValueError("global_plan v1 does not enable independent new LOOKUP preparation")
+            if not self.connector.scheduler_adapter._nonblocking_lookup_status:
+                raise ValueError("global_plan requires nonblocking LOOKUP STATUS")
+            if not self._decoupled_control:
+                raise ValueError("global_plan requires bounded existing control progression")
+            if getattr(self.connector, "_eager_prefetch", False):
+                raise ValueError("global_plan does not authorize eager enqueue LOOKUP")
+            new_lookup = extra.get("lmcache.mp.plan_new_lookup", False)
+            lookup_limit = extra.get("lmcache.mp.plan_lookup_limit", self._operation_limit)
+            load_limit = extra.get("lmcache.mp.plan_load_limit", self._operation_limit)
+            if type(new_lookup) is not bool or any(type(v) is not int or v <= 0 for v in (lookup_limit, load_limit)):
+                raise ValueError("plan limits must be positive integers; plan_new_lookup must be bool")
+            self._global_plan = PlanRuntime(new_lookup=new_lookup,
+                lookup_limit=lookup_limit, load_limit=load_limit)
+            self._action_feedback.policy = self._global_plan
         if self.connector.decoupled_store_enabled:
             self.connector.set_operation_decider(self._decide_store_operation)
 
@@ -488,6 +510,8 @@ class Scheduler(SchedulerInterface):
         observes native transitions and may only update policy-owned state.
         None restores the native fast path without constructing snapshots.
         """
+        if getattr(self, "_global_plan", None) is not None:
+            raise ValueError("use set_prefill_plan_policy in global plan mode")
         self._check_action_entry()
         if self._action_feedback is None:
             raise RuntimeError("lmcache.mp.action_feedback is disabled")
@@ -659,6 +683,23 @@ class Scheduler(SchedulerInterface):
         if getattr(self, "_decoupled_control", False):
             self._operation_requests.pop(request.request_id, None)
 
+    def set_prefill_plan_policy(self, policy=None):
+        """Trusted synchronous plan(snapshot); immutable values, no owner handles."""
+        from vllm.v1.core.sched.global_plan import NativePlan
+        self._check_action_entry()
+        if self._global_plan is None:
+            raise RuntimeError("lmcache.mp.global_plan is disabled")
+        if policy is not None and not callable(getattr(policy, "plan", None)):
+            raise TypeError("policy must implement plan(snapshot)")
+        self._global_plan.policy = NativePlan() if policy is None else policy
+
+    def get_prefill_candidate_snapshot(self):
+        """Pure complete view of native owners, not a readiness certification."""
+        if self._global_plan is None:
+            raise RuntimeError("lmcache.mp.global_plan is disabled")
+        return self._global_plan.read_snapshot(
+            self, self._operation_budget, self._operation_input_budget)
+
     def get_prefill_operation_step_view(self):
         """Return observations only; no matching, allocation or ownership changes."""
         from vllm.v1.core.sched.prefill_operations import OperationView, StepOperationView
@@ -695,6 +736,8 @@ class Scheduler(SchedulerInterface):
         )
 
     def set_prefill_operation_decider(self, decider) -> None:
+        if getattr(self, "_global_plan", None) is not None:
+            raise ValueError("legacy decider cannot replace a global plan")
         self._check_action_entry()
         if not getattr(self, "_prefill_operations_enabled", False):
             raise RuntimeError("decoupled control is disabled")
@@ -724,7 +767,8 @@ class Scheduler(SchedulerInterface):
             del self._step_operations[:-self._operation_limit]
         if self._action_feedback is not None and not self._action_legacy_decider:
             from vllm.v1.core.sched.prefill_operations import ActionKind, ResultKind
-            action = self._action_feedback.decide(view, self.get_prefill_operation_step_view)
+            action = (self._global_plan.action(view) if self._global_plan is not None
+                      else self._action_feedback.decide(view, self.get_prefill_operation_step_view))
             if action.kind == ActionKind.KEEP_RETAINED_STORE:
                 evidence = self._action_feedback.find(view.request_id, "store", commitment_id=view.operation_id)
                 if evidence is not None:
@@ -746,7 +790,13 @@ class Scheduler(SchedulerInterface):
     def _progress_retained_store_operations(self):
         if not self.connector.decoupled_store_enabled:
             return
-        candidates = self.connector.get_retained_store_candidates(self._operation_limit)
+        if self._global_plan is None:
+            candidates = self.connector.get_retained_store_candidates(self._operation_limit)
+        else:
+            candidates = self.connector.get_retained_store_candidates(
+                self._operation_limit,
+                preferred_ids=tuple(k for k, v in self._global_plan.stores.items() if v.submit),
+                excluded_ids=tuple(k for k, v in self._global_plan.stores.items() if not v.submit))
         for candidate in candidates:
             if self._decide_store_operation(candidate) == "submit":
                 self.connector.request_store_submission([candidate["operation_id"]])
@@ -798,7 +848,8 @@ class Scheduler(SchedulerInterface):
         if self._action_feedback is not None and not self._action_legacy_decider:
             from vllm.v1.core.sched.prefill_operations import ActionKind, ResultKind
             evidence = self._action_attempt(request, kind, start, end, renew=True)
-            action = self._action_feedback.decide(view, self.get_prefill_operation_step_view)
+            action = (self._global_plan.action(view) if self._global_plan is not None
+                      else self._action_feedback.decide(view, self.get_prefill_operation_step_view))
             if action.kind != ActionKind.ATTEMPT:
                 self._action_feedback.report(evidence, ResultKind.NOT_ATTEMPTED,
                                              reason=action.kind.value)
@@ -1100,6 +1151,11 @@ class Scheduler(SchedulerInterface):
             num_new_local_computed_tokens + num_external_computed_tokens
         )
         assert num_computed_tokens <= request.num_tokens
+        if getattr(self, "_global_plan", None) is not None:
+            from vllm.v1.core.sched.global_plan import MatchObservation
+            self._global_plan.matches[request.request_id] = MatchObservation(
+                num_new_local_computed_tokens, num_external_computed_tokens,
+                num_computed_tokens, time.monotonic_ns(), self.current_step)
         return PrefixMatch(
             new_computed_blocks, num_new_local_computed_tokens,
             num_external_computed_tokens, num_computed_tokens, load_kv_async,
@@ -1202,6 +1258,14 @@ class Scheduler(SchedulerInterface):
         if compute_budget_enabled:
             self._compute_budget_begin()
 
+        plan_runtime = getattr(self, "_global_plan", None)
+        if plan_runtime is not None:
+            self._operation_budget, self._operation_input_budget = token_budget, input_budget
+            stats = plan_runtime.begin(self, token_budget, input_budget)
+            wait_emit("global_plan_snapshot", step=self.current_step, **{
+                k: v for k, v in stats.items() if k != "step"})
+            compute_batch_end = plan_runtime.current.end_compute
+
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
         defer_prefills = (
@@ -1209,7 +1273,9 @@ class Scheduler(SchedulerInterface):
         ) and any(not r.is_prefill_chunk for r in self.running)
 
         # First, schedule the RUNNING requests.
-        global_order = getattr(self, "_global_sjf_input_enabled", False)
+        sjf_order = getattr(self, "_global_sjf_input_enabled", False)
+        explicit_plan = plan_runtime is not None
+        global_order = sjf_order or explicit_plan
         step_skipped_waiting = create_request_queue(self.policy)
         action_feedback = getattr(self, "_action_feedback", None) is not None
         policy_skipped = set()
@@ -1221,7 +1287,17 @@ class Scheduler(SchedulerInterface):
             from vllm.v1.core.sched.global_sjf_rollback import StepAllocationLedger
             ledger = StepAllocationLedger(self, emit=wait_emit)
 
+        def observe_global(request, **fields):
+            if sjf_order:
+                self._global_sjf_observe_result(request, **fields)
+            elif explicit_plan:
+                wait_emit("global_plan_execution", request.request_id,
+                          step=self.current_step, **fields)
+
         def mark(request, reason, **fields):
+            if plan_runtime is not None and reason in ("running_visited", "waiting_visited"):
+                plan_runtime.checked.add(request.request_id)
+                plan_runtime.check_count += 1
             compute_mark(self, request, reason, **fields)
             if action_feedback and reason in (
                 "lookup_pending", "blocked_waiting_dependency", "stale_output_pending",
@@ -1243,7 +1319,7 @@ class Scheduler(SchedulerInterface):
                     else "compute", "discovered", reason=reason,
                 )
             if global_order:
-                self._global_sjf_observe_result(
+                observe_global(
                     request, outcome="native_check", branch=active_branch,
                     reason=reason, remaining_budget=token_budget, **fields,
                 )
@@ -1260,7 +1336,9 @@ class Scheduler(SchedulerInterface):
                 rid = request.request_id
                 bucket = rollback_buckets.get(rid, 'running')
                 restored = num_scheduled_tokens.pop(rid, 0)
-                if compute_budget_enabled:
+                if action_feedback:
+                    self._action_revoke(rid)
+                elif compute_budget_enabled:
                     self._compute_budget_revoke(rid)
                 token_budget += restored
                 if restored:
@@ -1278,7 +1356,17 @@ class Scheduler(SchedulerInterface):
                 if bucket == "async_load":
                     # This LOAD has only been reserved; no connector metadata/DMA was
                     # dispatched. It loses a local-prefix dependency of this step.
-                    step_skipped_waiting.remove_request(request)
+                    # Explicit restore-only admission can leave the request in
+                    # its original owner, unlike the normal WAITING branch.
+                    for queue in (step_skipped_waiting, self.waiting, self.skipped_waiting):
+                        if request in queue:
+                            queue.remove_request(request)
+                    if action_feedback:
+                        from vllm.v1.core.sched.prefill_operations import ResultKind
+                        evidence = self._action_loads.pop(rid, None)
+                        if evidence is not None:
+                            self._action_feedback.report(evidence, ResultKind.REVOKED,
+                                reason="unsubmitted_restore_dependency_rolled_back")
                     self._free_request_blocks(request)
                     self._inflight_prefills.discard(request)
                     request.status = RequestStatus.PREEMPTED
@@ -1289,7 +1377,7 @@ class Scheduler(SchedulerInterface):
                 else:
                     self._preempt_request(request, scheduled_timestamp, drop_stale_output=self.requires_kv_delivery)
                 preempted_reqs.append(request)
-                self._global_sjf_observe_result(
+                observe_global(
                     request, outcome="same_step_rollback", branch=bucket,
                     reason="native_victim" if request is victim else "producer_rolled_back",
                     primary_victim=victim.request_id, revoked_quota=restored,
@@ -1484,7 +1572,7 @@ class Scheduler(SchedulerInterface):
                         if victim_index < req_index:
                             req_index -= 1
 
-                        if preempted_req in scheduled_running_reqs:
+                        if not global_order and preempted_req in scheduled_running_reqs:
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
                             restored = num_scheduled_tokens.pop(preempted_req_id)
@@ -1608,7 +1696,8 @@ class Scheduler(SchedulerInterface):
                 policy_skipped.add(request_id)
                 if not restore_only:
                     request_queue.pop_request()
-                    entry = policy_held_queues.setdefault(id(request_queue), (request_queue, []))
+                    owner = getattr(request_queue, "queue", request_queue)
+                    entry = policy_held_queues.setdefault(id(owner), (owner, []))
                     entry[1].append(request)
 
             if action_feedback and (request_id in policy_skipped
@@ -1617,14 +1706,17 @@ class Scheduler(SchedulerInterface):
                 return True
             def defer_waiting_request():
                 if not restore_only:
+                    if explicit_plan and getattr(request_queue, "queue", None) is self.skipped_waiting:
+                        return  # Explicit traversal visits once; retain the original slot.
                     request_queue.pop_request()
-                    if action_feedback and request_queue is self.skipped_waiting:
+                    owner = getattr(request_queue, "queue", request_queue)
+                    if action_feedback and owner is self.skipped_waiting:
                         # Native dependency skips and policy skips can interleave
                         # in this queue. Restore their shared encounter order,
                         # not two separately prepended groups. New native skips
                         # from WAITING still use the original destination below.
                         entry = policy_held_queues.setdefault(
-                            id(request_queue), (request_queue, []))
+                            id(owner), (owner, []))
                         entry[1].append(request)
                     else:
                         step_skipped_waiting.prepend_request(request)
@@ -1676,7 +1768,7 @@ class Scheduler(SchedulerInterface):
                 match = self._match_waiting_prefix(
                     request, phase="restore_control" if restore_only else (
                         "takeover" if prepared else "native"),
-                    existing_lookup_only=restore_only or prepared or (conditional_end and self._conditional_existing_lookup(request)) or (
+                    existing_lookup_only=explicit_plan or restore_only or prepared or (conditional_end and self._conditional_existing_lookup(request)) or (
                         compute_budget_enabled
                         and request.request_id in self._compute_budget_retry_matches
                     ),
@@ -1720,7 +1812,16 @@ class Scheduler(SchedulerInterface):
                 num_new_local_computed_tokens = 0
                 num_computed_tokens = request.num_computed_tokens
             mark(request, "matched", matched=num_computed_tokens, async_load=load_kv_async, external=num_external_computed_tokens)
+            if explicit_plan and not restore_only and load_kv_async:
+                self._action_blocked(request, "compute", "requires_selected_LOAD")
+                mark(request, "plan_compute_requires_LOAD")
+                return True
             if restore_only and not load_kv_async:
+                if explicit_plan:
+                    from vllm.v1.core.sched.prefill_operations import ResultKind
+                    evidence = self._action_attempt(request, "load", num_new_local_computed_tokens, num_computed_tokens)
+                    self._action_feedback.report(evidence, ResultKind.NOT_REQUIRED,
+                        reason="current_hbm_needs_no_restore", native_phase="takeover_match")
                 self._observe_operation(
                     request, "load", "dependencies_checked",
                     num_new_local_computed_tokens, num_computed_tokens,
@@ -2017,7 +2118,9 @@ class Scheduler(SchedulerInterface):
                     EngineCoreEventType.SCHEDULED, scheduled_timestamp
                 )
             if request.status == RequestStatus.WAITING or (
-                global_order and request.request_id not in self._global_sjf_worker_initialized
+                global_order and request.request_id not in (
+                    self._global_sjf_worker_initialized if sjf_order
+                    else plan_runtime.worker_initialized)
             ):
                 scheduled_new_reqs.append(request)
             elif request.status == RequestStatus.PREEMPTED:
@@ -2073,22 +2176,11 @@ class Scheduler(SchedulerInterface):
                         self.ec_connector.update_state_after_alloc(request, i)
             return not compute_batch_end
 
-        if not global_order:
-            active_branch = "running"
-            while req_index < len(self.running) and token_budget > 0:
-                if not process_running(self.running[req_index]):
-                    break
-            # Record the LoRAs in scheduled_running_reqs
-            if self.lora_config:
-                scheduled_loras = set(
-                    req.lora_request.lora_int_id
-                    for req in scheduled_running_reqs
-                    if req.lora_request and req.lora_request.lora_int_id > 0
-                )
-                assert len(scheduled_loras) <= self.lora_config.max_loras
-
+        def prepare_restore_operations(skip_ids=(), max_attempts=None):
+            nonlocal active_branch
             if (decoupled_control and not preempted_reqs
                     and self._pause_state == PauseState.UNPAUSED):
+                remaining = self._operation_limit if max_attempts is None else max_attempts
                 self._operation_budget = token_budget
                 self._operation_input_budget = input_budget
                 control_wall, control_cpu = time.perf_counter_ns(), time.thread_time_ns()
@@ -2107,6 +2199,11 @@ class Scheduler(SchedulerInterface):
                 # keep their original paths. Both modes use the same RR view.
                 for request in (self._operation_candidates
                                 if self.connector.prepare_load_operations else ()):
+                    if remaining <= 0:
+                        break
+                    if request.request_id in skip_ids:
+                        continue
+                    remaining -= 1
                     if (request.status not in (
                         RequestStatus.WAITING, RequestStatus.PREEMPTED
                     ) or request.num_computed_tokens != 0):
@@ -2130,6 +2227,22 @@ class Scheduler(SchedulerInterface):
                           wall_ns=time.perf_counter_ns()-control_wall,
                           thread_cpu_ns=time.thread_time_ns()-control_cpu)
 
+        if not global_order:
+            active_branch = "running"
+            while not compute_batch_end and req_index < len(self.running) and token_budget > 0:
+                if not process_running(self.running[req_index]):
+                    break
+            # Record the LoRAs in scheduled_running_reqs
+            if self.lora_config:
+                scheduled_loras = set(
+                    req.lora_request.lora_int_id
+                    for req in scheduled_running_reqs
+                    if req.lora_request and req.lora_request.lora_int_id > 0
+                )
+                assert len(scheduled_loras) <= self.lora_config.max_loras
+
+            prepare_restore_operations()
+
             if not conditional_stop and not compute_batch_end and not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
                 active_branch = "waiting"
                 while (self.waiting or self.skipped_waiting) and token_budget > 0:
@@ -2142,50 +2255,103 @@ class Scheduler(SchedulerInterface):
                 if not defer_prefills:
                     self.prefill_capacity_bound = bool(self.waiting)
         else:
-            # A view removes only the visited WAITING request if its native branch
-            # consumes it. The owning queue and self.running keep their native order.
-            class QueueView:
-                def __init__(self, queue, request):
-                    self.queue, self.request = queue, request
-                def peek_request(self):
-                    return self.request
-                def pop_request(self):
-                    self.queue.remove_request(self.request)
-                    return self.request
-
-            initial_running = {id(r) for r in self.running}
-            owners = {id(r): q for q in (self.waiting, self.skipped_waiting) for r in q}
-            visited = set()
+            from vllm.v1.core.sched.global_sjf_rollback import QueueView, candidate_references
+            if explicit_plan:
+                dispatch_wall, dispatch_cpu = time.perf_counter_ns(), time.thread_time_ns()
+                from vllm.v1.core.sched.global_plan import OperationKind
+            if sjf_order:
+                entries = [(r, None) for r in self._global_sjf_candidates()]
+            else:
+                entries = [(self.requests[item.request_id], item) for item in plan_runtime.attempts
+                           if item.request_id in self.requests]
+            references = candidate_references(self, (r for r, _ in entries), unique=not explicit_plan)
             waiting_closed = self._pause_state != PauseState.UNPAUSED
-            for request in self._global_sjf_candidates():
-                if compute_batch_end or token_budget <= 0 or input_budget <= draft_slots:
-                    break
-                if id(request) in visited:
-                    raise AssertionError("candidate visited twice")
-                visited.add(id(request))
+            for (request, active_branch, queue), (_, entry) in zip(references, entries):
+                rid = request.request_id
                 if request in preempted_reqs:
                     continue
-                active_branch = "running" if id(request) in initial_running else "waiting"
+                if explicit_plan:
+                    plan_runtime.active_item = entry
+                    initial = plan_runtime.request_views[rid]
+                    if entry.kind == OperationKind.LOOKUP:
+                        if (self._pause_state != PauseState.UNPAUSED
+                                or plan_runtime.lookup_attempted >= plan_runtime.lookup_limit):
+                            observe_global(request, kind="lookup", outcome="not_checked", reason="lookup_limit_or_pause")
+                            continue
+                        state = self.connector.lookup_operation_state(rid)
+                        if (initial.lookup_submitted or initial.lookup_result_known
+                                or state["submitted"] or state["result_known"]
+                                or request.status != RequestStatus.WAITING
+                                or request.num_computed_tokens != 0):
+                            observe_global(request, kind="lookup", outcome="not_required", reason="already_submitted_or_native_state")
+                            continue
+                        plan_runtime.checked.add(rid)
+                        plan_runtime.check_count += 1
+                        plan_runtime.lookup_attempted += 1
+                        state = plan_runtime.call_native(self.connector.prepare_lookup_operation, request, planned=True)
+                        if state["submitted"]:
+                            plan_runtime.lookup_submitted += 1
+                        observe_global(request, kind="lookup", outcome="submitted" if state["submitted"] else "blocked",
+                                       reason="native_LOOKUP_submit_only")
+                        continue
+                    if entry.kind == OperationKind.LOAD:
+                        if (self._pause_state != PauseState.UNPAUSED or preempted_reqs
+                                or plan_runtime.load_attempted >= plan_runtime.load_limit):
+                            observe_global(request, kind="load", outcome="not_checked", reason="load_limit_or_pause")
+                            continue
+                        plan_runtime.load_attempted += 1
+                        if (not initial.lookup_result_known or initial.lookup_result_tokens <= 0
+                                or active_branch != "waiting" or request.status not in (
+                                    RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                                or request.num_computed_tokens != 0):
+                            self._action_blocked(request, "load", "known_positive_lookup_and_native_waiting_required")
+                            continue
+                        active_branch = "restore_control"
+                        plan_runtime.call_native(process_waiting, QueueView(queue, request), restore_only=True)
+                        continue
+                    if (active_branch == "waiting" and request.num_computed_tokens == 0
+                            and request.num_preemptions == 0 and not initial.lookup_result_known
+                            and initial.native_lookup_fallback is None):
+                        self._action_blocked(request, "compute", "lookup_result_not_in_snapshot")
+                        continue
+                    if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                        self._action_blocked(request, "compute", "restore_not_published")
+                        continue
+                if compute_batch_end or token_budget <= 0 or input_budget <= draft_slots:
+                    if sjf_order:
+                        break
+                    observe_global(request, kind="compute", outcome="not_checked", reason="compute_selection_closed")
+                    continue
                 if active_branch == "running":
                     if request.status != RequestStatus.RUNNING or request not in self.running:
-                        self._global_sjf_observe_result(request, outcome="not_checked", branch=active_branch, reason="ownership_changed")
+                        observe_global(request, outcome="not_checked", branch=active_branch, reason="ownership_changed")
                         continue
                     req_index = self.running.index(request)
-                    process_running(request)
+                    if explicit_plan:
+                        plan_runtime.call_native(process_running, request)
+                    else:
+                        process_running(request)
                 elif waiting_closed or preempted_reqs:
-                    self._global_sjf_observe_result(request, outcome="not_checked", branch=active_branch, reason="waiting_admission_closed")
+                    observe_global(request, outcome="not_checked", branch=active_branch, reason="waiting_admission_closed")
                 else:
                     if len(self.running) + self.num_waiting_for_streaming_input >= self.max_num_running_reqs:
                         waiting_closed = True
-                        self._global_sjf_observe_result(request, outcome="blocked", branch=active_branch, reason="max_num_seqs", remaining_budget=token_budget)
+                        mark(request, "operation_max_num_seqs")
                         continue
-                    queue = owners[id(request)]
-                    if not process_waiting(QueueView(queue, request)):
+                    keep_waiting = (plan_runtime.call_native(process_waiting, QueueView(queue, request))
+                                    if explicit_plan else process_waiting(QueueView(queue, request)))
+                    if not keep_waiting and not compute_batch_end:
                         waiting_closed = True
-                if request.request_id in num_scheduled_tokens:
-                    self._global_sjf_observe_result(request, outcome="allocated", branch=active_branch, quota=num_scheduled_tokens[request.request_id], remaining_budget=token_budget)
+                if rid in num_scheduled_tokens:
+                    observe_global(request, outcome="allocated", branch=active_branch, quota=num_scheduled_tokens[rid], remaining_budget=token_budget)
                 elif request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
-                    self._global_sjf_observe_result(request, outcome="restore_pending", branch=active_branch, reason="native_remote_dependency", remaining_budget=token_budget)
+                    observe_global(request, outcome="restore_pending", branch=active_branch, reason="native_remote_dependency", remaining_budget=token_budget)
+            # There is deliberately no implicit extra-LOAD or new-LOOKUP pass
+            # here. Only plan items above may enter these submission paths.
+            if explicit_plan:
+                plan_runtime.active_item = None
+                plan_runtime.dispatch_wall_ns = time.perf_counter_ns()-dispatch_wall
+                plan_runtime.dispatch_cpu_ns = time.thread_time_ns()-dispatch_cpu
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
             if self._pause_state == PauseState.UNPAUSED and not defer_prefills:
@@ -2371,8 +2537,10 @@ class Scheduler(SchedulerInterface):
         if self.defer_block_free and total_num_scheduled_tokens > 0:
             self.sched_step_seq += 1
 
-        if global_order:
+        if sjf_order:
             self._global_sjf_observe_step_end(scheduler_output)
+        if plan_runtime is not None:
+            wait_emit("global_plan_step", **plan_runtime.final_stats(scheduler_output))
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
@@ -3457,6 +3625,8 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            if getattr(self, "_global_plan", None) is not None:
+                self._global_plan.register(request.request_id)
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.spec_decode_metrics_level != "none":
