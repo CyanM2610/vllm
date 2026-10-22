@@ -86,6 +86,7 @@ from vllm.v1.fault_tolerance.engine_core_sentinel import (
     fault_tolerant_wrapper,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, get_kv_cache_spec_kind
+from vllm.v1.compute_probe import terminal as compute_terminal
 from vllm.v1.kv_wait_trace import emit as wait_emit, close as wait_close
 from vllm.v1.metrics.stats import SchedulerIterationDetails, SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
@@ -779,6 +780,7 @@ class EngineCore:
         # before it exits and release cached memory.
         cleanup_dist_env_and_memory()
         logger.debug_once("[shutdown] EngineCore: local resource teardown complete")
+        compute_terminal()
         wait_close()
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):

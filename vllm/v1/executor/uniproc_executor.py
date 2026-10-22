@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 
 import vllm.envs as envs
+from vllm.v1.compute_probe import executor as compute_executor
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import (
@@ -118,6 +119,7 @@ class UniProcExecutor(Executor):
             future.set_exception(e)
         return future
 
+    @compute_executor("execute")
     def execute_model(  # type: ignore[override]
         self, scheduler_output: SchedulerOutput, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
@@ -133,6 +135,7 @@ class UniProcExecutor(Executor):
             output.result()
         return output
 
+    @compute_executor("sample")
     def sample_tokens(  # type: ignore[override]
         self, grammar_output: GrammarOutput | None, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:

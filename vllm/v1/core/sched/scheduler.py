@@ -24,6 +24,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.v1.compute_probe import scheduled as compute_scheduled, adopted as compute_adopted, mark as compute_mark
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsManager,
@@ -500,6 +501,7 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    @compute_scheduled
     @retirement_call("schedule")
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
@@ -555,6 +557,7 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            compute_mark(self, request, "running_visited")
             if input_budget <= draft_slots:
                 break
 
@@ -571,18 +574,21 @@ class Scheduler(SchedulerInterface):
                 # Async scheduling: Avoid scheduling an extra step when we are sure that
                 # the previous step has reached request.max_tokens. We don't schedule
                 # partial draft tokens since this prevents uniform decode optimizations.
+                compute_mark(self, request, "output_limit_guard")
                 req_index += 1
                 continue
 
             if self.current_step < request.next_decode_eligible_step:
                 # V2+PP+async: enforce `pp_size` steps between same-req decodes
                 # to match worker-side sampled-tokens broadcast slot ring cadence.
+                compute_mark(self, request, "decode_cadence")
                 req_index += 1
                 continue
 
             if defer_prefills and request.is_prefill_chunk:
                 # DP prefill balancing: defer this in-progress prefill chunk to a
                 # cadence-aligned step; decodes still run to fill this step.
+                compute_mark(self, request, "prefill_throttle")
                 req_index += 1
                 continue
 
@@ -653,6 +659,7 @@ class Scheduler(SchedulerInterface):
                 # NOTE(woosuk): Here, by doing `continue` instead of `break`,
                 # we do not strictly follow the FCFS scheduling policy and
                 # allow the lower-priority requests to be scheduled.
+                compute_mark(self, request, "native_zero_quota")
                 req_index += 1
                 continue
 
@@ -722,6 +729,7 @@ class Scheduler(SchedulerInterface):
                 # Cannot schedule this request.
                 break
 
+            compute_mark(self, request, "running_allocated", quota=num_new_tokens)
             # Schedule the request.
             scheduled_running_reqs.append(request)
             prefill_scheduled |= request.is_prefill_chunk
@@ -793,6 +801,7 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                compute_mark(self, request, "waiting_visited")
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -875,6 +884,7 @@ class Scheduler(SchedulerInterface):
                             async_load=load_kv_async,
                         )
                         if ext_tokens is None:
+                            compute_mark(self, request, "lookup_pending")
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
@@ -952,12 +962,14 @@ class Scheduler(SchedulerInterface):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
+                compute_mark(self, request, "matched", matched=num_computed_tokens, async_load=load_kv_async, external=num_external_computed_tokens)
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
                 pad_spec_decode = False
 
                 if load_kv_async:
+                    compute_mark(self, request, "restore_pending", matched=num_computed_tokens)
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
                     num_new_tokens = 0
@@ -1200,6 +1212,7 @@ class Scheduler(SchedulerInterface):
                 req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
                     request_id
                 )
+                compute_mark(self, request, "waiting_allocated", quota=num_new_tokens, matched=num_computed_tokens)
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
@@ -1836,6 +1849,7 @@ class Scheduler(SchedulerInterface):
         return GrammarOutput(structured_output_request_ids, bitmask)
 
     @retirement_call("consume")
+    @compute_adopted
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,

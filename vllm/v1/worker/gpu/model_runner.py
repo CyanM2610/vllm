@@ -37,6 +37,7 @@ from vllm.distributed.parallel_state import (
     get_pp_group,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.v1.compute_probe import worker as compute_worker, current_batch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
@@ -1516,6 +1517,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
     @torch.inference_mode()
+    @compute_worker
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -1779,7 +1781,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         wait_once("first_compute_launch", wait_rid)
                     with wait_span("model_forward", ",".join(input_batch.req_ids),
                                    request_ids=input_batch.req_ids):
-                        model_output = self.model(**model_inputs)
+                        with wait_span("batch_forward", current_batch(), batch_id=current_batch()):
+                            model_output = self.model(**model_inputs)
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -1864,9 +1867,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.pcp_manager, hidden_states, input_batch
         )
 
-        sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
-        )
+        with wait_span("batch_sampling", current_batch(), batch_id=current_batch()):
+            sampler_output, num_sampled, num_rejected = self.sample(
+                hidden_states, input_batch, grammar_output
+            )
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
