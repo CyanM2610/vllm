@@ -30,7 +30,11 @@ class ComputeBudgetMixin:
         )
 
     def _compute_budget_initialize(self, mode, config_path=None):
-        scope, errors = frozen_config_scope(self.vllm_config, self.block_size)
+        native_large = (mode == "off" and not getattr(self, "_global_sjf_input_enabled", False)
+                        and self.scheduler_config.max_num_batched_tokens == 4096)
+        hard_cap = 4096 if native_large else 2048
+        scope, errors = frozen_config_scope(
+            self.vllm_config, self.block_size, expected_token_budget=hard_cap)
         config = self.vllm_config.kv_transfer_config.kv_connector_extra_config or {}
         for name in (
             "decoupled_control",
@@ -43,11 +47,11 @@ class ComputeBudgetMixin:
             self, "_conditional_end_enabled", False
         ):
             errors.append("operation_or_conditional_end_scheduler")
-        if not self.use_v2_model_runner or self.max_num_scheduled_tokens != 2048:
-            errors.append("V2_hard_2048")
+        if not self.use_v2_model_runner or self.max_num_scheduled_tokens != hard_cap:
+            errors.append("V2_native_hard_budget")
         if (
             self.max_num_running_reqs != 32
-            or self.scheduler_config.max_num_batched_tokens != 2048
+            or self.scheduler_config.max_num_batched_tokens != hard_cap
         ):
             errors.append("native_input_or_sequence_budget")
         for name in (
@@ -91,13 +95,13 @@ class ComputeBudgetMixin:
                 raise ValueError("unknown time model schema or unit")
             model = BatchTimeModel(**config["coefficients"], tau_ms=config["tau_ms"])
             identity = {"sha256": hashlib.sha256(data).hexdigest(), "config": config}
-        self._compute_budget = ComputeBatchBudget(mode, model)
+        self._compute_budget = ComputeBatchBudget(mode, model, hard_cap=hard_cap)
         self._compute_budget_retry_matches = set()
         emit(
             "compute_budget_enabled",
             mode=mode,
             fixed_cap=1024,
-            hard_cap=2048,
+            hard_cap=hard_cap,
             minimum_legal_tokens=1,
             model=identity,
             scope=scope,

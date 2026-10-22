@@ -66,11 +66,16 @@ class ComputeBatchBudget:
     cache state, request queues, future arrivals or reference output lengths.
     """
 
-    def __init__(self, mode: str, model: BatchTimeModel | None = None) -> None:
+    def __init__(self, mode: str, model: BatchTimeModel | None = None, *, hard_cap: int = 2048) -> None:
         if mode not in ("off", "fixed", "time"):
             raise ValueError("compute mode must be off, fixed or time")
         if mode == "time" and model is None:
             raise ValueError("time mode requires a frozen model and tau")
+        if type(hard_cap) is not int or hard_cap not in (2048, 4096):
+            raise ValueError("unsupported native hard budget")
+        if hard_cap != 2048 and mode != "off":
+            raise ValueError("4096 extension is native/off only")
+        self.hard_cap = hard_cap
         self.mode = mode
         self.model = model
         self.records: dict[str, tuple[int, int]] = {}
@@ -92,12 +97,12 @@ class ComputeBatchBudget:
             type(p) is not int
             or p < 0
             or type(native_tokens) is not int
-            or not 1 <= native_tokens <= 2048
+            or not 1 <= native_tokens <= self.hard_cap
             or request_id in self.records
         ):
             raise ValueError("invalid or duplicate native compute proposal")
         Q, A, N = self.terms()
-        if Q + native_tokens > 2048:
+        if Q + native_tokens > self.hard_cap:
             raise ValueError("native proposal exceeds remaining hard token budget")
         calls = 0
         prediction_wall_ns = prediction_thread_cpu_ns = 0

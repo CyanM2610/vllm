@@ -43,7 +43,7 @@ def _field(value, dotted):
     return value
 
 
-def frozen_config_scope(vllm_config, block_size):
+def frozen_config_scope(vllm_config, block_size, *, expected_token_budget=2048):
     """Pure field checks; absent fields are rejected, never assumed supported."""
     expected = {
         "scheduler_config.async_scheduling": True,
@@ -52,7 +52,7 @@ def frozen_config_scope(vllm_config, block_size):
         "scheduler_config.is_multimodal_model": False,
         "scheduler_config.enable_chunked_prefill": True,
         "scheduler_config.scheduler_reserve_full_isl": True,
-        "scheduler_config.max_num_batched_tokens": 2048,
+        "scheduler_config.max_num_batched_tokens": expected_token_budget,
         "scheduler_config.max_num_seqs": 32,
         "scheduler_config.long_prefill_token_threshold": 0,
         "cache_config.enable_prefix_caching": True,
@@ -80,7 +80,7 @@ def frozen_config_scope(vllm_config, block_size):
     observed["scheduler_config.max_num_scheduled_tokens"] = (
         "<missing>" if scheduled is _MISSING else scheduled
     )
-    if scheduled is _MISSING or scheduled not in (None, 2048):
+    if scheduled is _MISSING or scheduled not in (None, expected_token_budget):
         errors.append("scheduler_config.max_num_scheduled_tokens")
     extra = _field(vllm_config, "kv_transfer_config.kv_connector_extra_config")
     for name, wanted in [
