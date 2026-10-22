@@ -670,9 +670,10 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
-        batch_slice = getattr(self, "_batch_slice_enabled", False)
-        if batch_slice:
-            self._batch_slice_begin()
+        conditional_end = getattr(self, "_conditional_end_enabled", False)
+        conditional_stop = False
+        if conditional_end:
+            self._conditional_begin()
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
@@ -745,12 +746,8 @@ class Scheduler(SchedulerInterface):
                 )
 
         def process_running(request):
-            nonlocal req_index, token_budget, input_budget, encoder_compute_budget, prefill_scheduled
+            nonlocal req_index, token_budget, input_budget, encoder_compute_budget, prefill_scheduled, conditional_stop
             mark(request, "running_visited")
-            if batch_slice and self._batch_slice_defer_running(request):
-                mark(request, "batch_slice_hold")
-                req_index += 1
-                return True
             if input_budget <= draft_slots:
                 return False
 
@@ -856,6 +853,13 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 return True
 
+            if conditional_end and self._conditional_should_stop(
+                request, p=request.num_computed_tokens, quota=num_new_tokens,
+                branch="running", selected_tokens=num_scheduled_tokens,
+            ):
+                conditional_stop = True
+                return False
+
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
@@ -933,12 +937,10 @@ class Scheduler(SchedulerInterface):
             if global_order:
                 ledger.record(request, 'running', request.num_computed_tokens, num_new_tokens)
             mark(request, "running_allocated", quota=num_new_tokens)
+            if conditional_end:
+                self._conditional_selected(request, request.num_computed_tokens, num_new_tokens, "running")
             # Schedule the request.
-            if batch_slice and self._batch_slice_first_submit(request):
-                scheduled_new_reqs.append(request)
-                new_blocks = self.kv_cache_manager.get_blocks(request.request_id)
-            else:
-                scheduled_running_reqs.append(request)
+            scheduled_running_reqs.append(request)
             prefill_scheduled |= request.is_prefill_chunk
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
@@ -982,7 +984,7 @@ class Scheduler(SchedulerInterface):
             return True
 
         def process_waiting(request_queue):
-            nonlocal token_budget, input_budget, encoder_compute_budget, has_sync_kv_loads
+            nonlocal token_budget, input_budget, encoder_compute_budget, has_sync_kv_loads, conditional_stop
             if input_budget <= draft_slots:
                 return False
             # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
@@ -992,11 +994,6 @@ class Scheduler(SchedulerInterface):
                 return False
             request = request_queue.peek_request()
             request_id = request.request_id
-            if batch_slice and self._batch_slice_defer_waiting(request):
-                request_queue.pop_request()
-                step_skipped_waiting.prepend_request(request)
-                mark(request, "batch_slice_common_preparation")
-                return True
             mark(request, "waiting_visited")
             # try to promote blocked statuses while traversing skipped queue.
             if self._is_blocked_waiting_status(
@@ -1044,13 +1041,10 @@ class Scheduler(SchedulerInterface):
             if request.num_computed_tokens == 0:
                 did_prefix_cache_lookup = True
                 prepared = getattr(self, "_global_sjf_match_prepare", False)
-                if batch_slice and self._batch_slice_is_target(request):
-                    match = self._batch_slice_take_match(request)
-                else:
-                    match = self._match_waiting_prefix(
-                        request, phase="takeover" if prepared else "native",
-                        existing_lookup_only=prepared,
-                    )
+                match = self._match_waiting_prefix(
+                    request, phase="takeover" if prepared else "native",
+                    existing_lookup_only=prepared or (conditional_end and self._conditional_existing_lookup(request)),
+                )
                 if match is None:
                     mark(request, "lookup_pending")
                     request_queue.pop_request()
@@ -1217,6 +1211,16 @@ class Scheduler(SchedulerInterface):
                 # only if it fits in (free - other in-flight reservations), to
                 # avoid deadlock and predictable preemptions.
                 reserved_blocks = self._inflight_prefill_reserved_blocks()
+            if conditional_end and not load_kv_async and self._conditional_should_stop(
+                request, p=num_computed_tokens, quota=num_new_tokens,
+                branch="waiting", selected_tokens=num_scheduled_tokens,
+                local_tokens=num_new_local_computed_tokens,
+                external_tokens=num_external_computed_tokens, blocks=new_computed_blocks,
+                full_sequence=self.scheduler_reserve_full_isl,
+                reserved_blocks=reserved_blocks, has_scheduled_reqs=bool(self.running),
+            ):
+                conditional_stop = True
+                return False
             new_blocks = self.kv_cache_manager.allocate_slots(
                 request,
                 num_new_tokens,
@@ -1266,15 +1270,14 @@ class Scheduler(SchedulerInterface):
                         num_hits=connector_prefix_cache_hits,
                         preempted=request.num_preemptions > 0,
                     )
+            if conditional_end:
+                self._conditional_adopted(request)
             # Record at admission so unscheduled lookups are not counted.
             if did_prefix_cache_lookup:
                 self.kv_cache_manager.record_prefix_cache_stats(
                     request, num_new_local_computed_tokens
                 )
             request = request_queue.pop_request()
-            if batch_slice and self._batch_slice_is_target(request):
-                self._batch_slice_hold(request, num_computed_tokens, num_new_tokens)
-                return True
             if load_kv_async:
                 # If loading async, allocate memory and put request
                 # into the WAITING_FOR_REMOTE_KV state.
@@ -1333,6 +1336,8 @@ class Scheduler(SchedulerInterface):
                 request_id
             )
             mark(request, "waiting_allocated", quota=num_new_tokens, matched=num_computed_tokens)
+            if conditional_end:
+                self._conditional_selected(request, num_computed_tokens, num_new_tokens, "waiting")
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
@@ -1377,7 +1382,7 @@ class Scheduler(SchedulerInterface):
                 )
                 assert len(scheduled_loras) <= self.lora_config.max_loras
 
-            if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+            if not conditional_stop and not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
                 active_branch = "waiting"
                 while (self.waiting or self.skipped_waiting) and token_budget > 0:
                     queue = self._select_waiting_queue_for_scheduling()
@@ -1438,9 +1443,6 @@ class Scheduler(SchedulerInterface):
             if self._pause_state == PauseState.UNPAUSED and not defer_prefills:
                 self.prefill_capacity_bound = bool(self.waiting)
 
-
-        if batch_slice:
-            self._batch_slice_end(num_scheduled_tokens, preempted_reqs)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
