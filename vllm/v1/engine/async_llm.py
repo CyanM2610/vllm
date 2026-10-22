@@ -52,6 +52,7 @@ from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollec
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.executor import Executor
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
+from vllm.v1.kv_wait_trace import emit as wait_emit
 from vllm.v1.metrics.loggers import (
     StatLoggerFactory,
     StatLoggerManager,
@@ -404,6 +405,16 @@ class AsyncLLM(EngineClient):
                 session_id,
             )
 
+        wait_logical_id = (
+            (params.extra_args or {}).get("native_token_replay_id")
+            if isinstance(params, SamplingParams)
+            else None
+        )
+        wait_emit(
+            "engine_input_process_begin",
+            wait_logical_id or request_id,
+            logical_id=wait_logical_id,
+        )
         # Convert Input --> Request.
         if isinstance(prompt, EngineCoreRequest):
             logger.warning_once(
@@ -460,6 +471,11 @@ class AsyncLLM(EngineClient):
             request.reasoning_parser_kwargs = reasoning_parser_kwargs
 
         self.input_processor.assign_request_id(request)
+        wait_emit(
+            "engine_input_process_end",
+            request.request_id,
+            logical_id=wait_logical_id,
+        )
 
         # We start the output_handler on the first call to add_request() so
         # we can call __init__ before the event loop, which enables us

@@ -48,6 +48,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm.utils.async_utils import merge_async_iterators
 from vllm.utils.collection_utils import as_list
 from vllm.utils.serial_utils import numpy2base64
+from vllm.v1.kv_wait_trace import emit as wait_emit
 
 logger = init_logger(__name__)
 
@@ -134,7 +135,18 @@ class OpenAIServingCompletion(GenerateBaseServing):
                 "Streaming is not currently supported with beam search"
             )
 
+        probe_request_id = (
+            raw_request.headers.get("X-Request-Id", request.request_id)
+            if raw_request is not None
+            else request.request_id
+        )
+        wait_emit("api_preprocess_begin", probe_request_id)
         result = await self.render_completion_request(request)
+        wait_emit(
+            "api_preprocess_end",
+            probe_request_id,
+            success=not isinstance(result, ErrorResponse),
+        )
         if isinstance(result, ErrorResponse):
             return result
 

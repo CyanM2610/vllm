@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import warnings
 from argparse import Namespace
 
@@ -53,4 +54,10 @@ def build_app(
     init_exception_handler(app)
     init_entrypoints_middleware(args, app, supported_tasks)
     app = sagemaker_standards_bootstrap(app)
+    if os.environ.get("KV_WAIT_TRACE_DIR"):
+        from vllm.entrypoints.serve.middleware.kv_wait_ingress import (
+            KVWaitIngressMiddleware,
+        )
+
+        app.add_middleware(KVWaitIngressMiddleware)
     return app

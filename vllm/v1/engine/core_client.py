@@ -63,6 +63,7 @@ from vllm.v1.fault_tolerance.utils import (
     FaultToleranceRequest,
     FaultToleranceResult,
 )
+from vllm.v1.kv_wait_trace import emit as wait_emit
 from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
@@ -1148,7 +1149,9 @@ class AsyncMPClient(MPClient):
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         request.client_index = self.client_index
+        wait_emit("engine_ipc_submit_begin", request.request_id)
         await self._send_input(EngineCoreRequestType.ADD, request)
+        wait_emit("engine_ipc_submit_end", request.request_id)
         self._ensure_output_queue_task()
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:

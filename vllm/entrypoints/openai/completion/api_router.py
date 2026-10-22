@@ -21,6 +21,7 @@ from vllm.entrypoints.serve.utils.api_utils import (
 )
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.logger import init_logger
+from vllm.v1.kv_wait_trace import emit as wait_emit
 
 logger = init_logger(__name__)
 
@@ -45,6 +46,11 @@ def completion(request: Request) -> OpenAIServingCompletion | None:
 @with_cancellation
 @load_aware_call
 async def create_completion(request: CompletionRequest, raw_request: Request):
+    wait_emit(
+        "api_handler_enter",
+        raw_request.headers.get("X-Request-Id", request.request_id),
+        declared_request_id=request.request_id,
+    )
     metrics_header_format = raw_request.headers.get(
         ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, ""
     )

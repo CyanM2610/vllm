@@ -86,6 +86,7 @@ from vllm.v1.fault_tolerance.engine_core_sentinel import (
     fault_tolerant_wrapper,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, get_kv_cache_spec_kind
+from vllm.v1.kv_wait_trace import emit as wait_emit
 from vllm.v1.metrics.stats import SchedulerIterationDetails, SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -1546,6 +1547,7 @@ class EngineCoreProc(EngineCore):
             return
         elif request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
+            wait_emit("engine_request_dequeued", req.request_id)
             if self._reject_add_in_shutdown(req):
                 return
             self.add_request(req, request_wave)
@@ -1752,6 +1754,7 @@ class EngineCoreProc(EngineCore):
                 for input_socket, _ in poller.poll():
                     # (RequestType, RequestData)
                     type_frame, *data_frames = input_socket.recv_multipart(copy=False)
+                    wait_socket_received_ns = time.monotonic_ns()
                     # NOTE(yongji): ignore READY message sent by DP coordinator
                     # that is used to notify newly started engines
                     if type_frame.buffer == b"READY":
@@ -1763,6 +1766,11 @@ class EngineCoreProc(EngineCore):
                     request: Any
                     if request_type == EngineCoreRequestType.ADD:
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
+                        wait_emit(
+                            "engine_request_received",
+                            req.request_id,
+                            socket_received_ns=wait_socket_received_ns,
+                        )
                         try:
                             request = self.preprocess_add_request(req)
                         except MultiModalCacheMissError as e:
@@ -1773,6 +1781,7 @@ class EngineCoreProc(EngineCore):
                         except Exception:
                             self._handle_request_preproc_error(req)
                             continue
+                        wait_emit("engine_request_preprocessed", req.request_id)
                     elif request_type == EngineCoreRequestType.UTILITY:
                         request = generic_decoder.decode(data_frames)
                         client_idx, call_id, method, args = request
