@@ -16,9 +16,10 @@ class BatchTimeModel:
     thetaA: float
     thetaN: float
     tau_ms: float
+    floor_ms: float = 0.0
 
     def __post_init__(self) -> None:
-        values = (self.theta0, self.thetaQ, self.thetaA, self.thetaN)
+        values = (self.theta0, self.thetaQ, self.thetaA, self.thetaN, self.floor_ms)
         if any(isinstance(v, bool) or not math.isfinite(v) or v < 0 for v in values):
             raise ValueError("time-model coefficients must be finite and nonnegative")
         if (
@@ -34,7 +35,7 @@ class BatchTimeModel:
         value = self.theta0 + self.thetaQ * Q + self.thetaA * A + self.thetaN * N
         if not math.isfinite(value):
             raise ValueError("time prediction overflow")
-        return value
+        return max(self.floor_ms, value)
 
 
 @dataclass(frozen=True)
@@ -73,8 +74,6 @@ class ComputeBatchBudget:
             raise ValueError("time mode requires a frozen model and tau")
         if type(hard_cap) is not int or hard_cap not in (2048, 4096):
             raise ValueError("unsupported native hard budget")
-        if hard_cap != 2048 and mode != "off":
-            raise ValueError("4096 extension is native/off only")
         self.hard_cap = hard_cap
         self.mode = mode
         self.model = model

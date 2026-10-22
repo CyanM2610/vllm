@@ -22,6 +22,11 @@ from vllm.v1.kv_wait_trace import emit
 class ComputeBudgetMixin:
     """Bind quota decisions independently of operation/fetch scheduling."""
 
+    @property
+    def _global_sjf_expected_token_budget(self):
+        # Only the explicit compute-budget subclass extends the parent scope.
+        return self.scheduler_config.max_num_batched_tokens
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._compute_budget_initialize(
@@ -30,9 +35,9 @@ class ComputeBudgetMixin:
         )
 
     def _compute_budget_initialize(self, mode, config_path=None):
-        native_large = (mode == "off" and not getattr(self, "_global_sjf_input_enabled", False)
-                        and self.scheduler_config.max_num_batched_tokens == 4096)
-        hard_cap = 4096 if native_large else 2048
+        hard_cap = self.scheduler_config.max_num_batched_tokens
+        if hard_cap not in (2048, 4096):
+            raise ValueError("unsupported compute hard budget")
         scope, errors = frozen_config_scope(
             self.vllm_config, self.block_size, expected_token_budget=hard_cap)
         config = self.vllm_config.kv_transfer_config.kv_connector_extra_config or {}
@@ -93,6 +98,8 @@ class ComputeBudgetMixin:
                 or config.get("unit") != "ms"
             ):
                 raise ValueError("unknown time model schema or unit")
+            if config.get("hard_token_budget", 2048) != hard_cap:
+                raise ValueError("time model hard budget differs from runtime")
             model = BatchTimeModel(**config["coefficients"], tau_ms=config["tau_ms"])
             identity = {"sha256": hashlib.sha256(data).hexdigest(), "config": config}
         self._compute_budget = ComputeBatchBudget(mode, model, hard_cap=hard_cap)

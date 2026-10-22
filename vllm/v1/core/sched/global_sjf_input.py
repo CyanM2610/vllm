@@ -184,7 +184,9 @@ class GlobalSJFInputScheduler(AsyncScheduler):
         self._global_sjf_worker_initialized = set()
         self._global_sjf_ordered_ids = []
         self._global_sjf_result_count = 0
-        snapshot, errors = frozen_config_scope(self.vllm_config, self.block_size)
+        snapshot, errors = frozen_config_scope(
+            self.vllm_config, self.block_size,
+            expected_token_budget=getattr(self, "_global_sjf_expected_token_budget", 2048))
         for path, wanted in {
             "kv_cache_manager.num_kv_cache_groups": 1,
             "num_lookahead_tokens": 0,
