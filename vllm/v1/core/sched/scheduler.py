@@ -503,6 +503,7 @@ class Scheduler(SchedulerInterface):
     @retirement_call("schedule")
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        wait_emit("schedule_begin", step=self.current_step)
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -1406,6 +1407,7 @@ class Scheduler(SchedulerInterface):
             self._update_after_schedule(scheduler_output)
         wait_emit(
             "schedule_output",
+            step=self.current_step,
             tokens=dict(num_scheduled_tokens),
             waiting=len(self.waiting),
             running=len(self.running),
@@ -2881,6 +2883,11 @@ class Scheduler(SchedulerInterface):
         assert self.connector is not None
 
         if request.request_id in self.failed_recving_kv_req_ids:
+            wait_emit(
+                "load_failure_recompute",
+                request.request_id,
+                recompute_enabled=self.recompute_kv_load_failures,
+            )
             # Request had KV load failures; num_computed_tokens was already
             # updated in _update_requests_with_invalid_blocks
             if request.num_computed_tokens:
