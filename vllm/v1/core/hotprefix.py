@@ -5,7 +5,7 @@
 
 import hashlib
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Protocol
 
@@ -544,6 +544,7 @@ class HotPrefixBlockEvictionSelector:
         self._apply_hotprefix_priority = apply_hotprefix_priority
         self._priorities: dict[int, float] = {}
         self._groups_by_block: dict[int, EvictionGroup] = {}
+        self._source_groups_by_block: dict[int, set[frozenset[int]]] = {}
         self._pending_group_keys: set[frozenset[int]] = set()
         self._terminal_group_keys: set[frozenset[int]] = set()
         self._deferred_group_keys: set[frozenset[int]] = set()
@@ -613,6 +614,7 @@ class HotPrefixBlockEvictionSelector:
                     for node in group.nodes:
                         nodes.setdefault(node.prefix_id, node)
                     old_key = frozenset(group.block_ids)
+                    self._unindex_group_sources(group)
                     was_pending = was_pending or old_key in self._pending_group_keys
                     was_terminal = was_terminal or old_key in self._terminal_group_keys
                     was_deferred = was_deferred or old_key in self._deferred_group_keys
@@ -633,6 +635,7 @@ class HotPrefixBlockEvictionSelector:
                 self._groups_by_block[block_id] = merged
                 self._priorities[block_id] = merged.priority
             merged_key = frozenset(merged.block_ids)
+            self._index_group_sources(merged)
             if was_pending:
                 self._pending_group_keys.add(merged_key)
             elif was_terminal:
@@ -732,12 +735,19 @@ class HotPrefixBlockEvictionSelector:
 
     def discard(self, block_ids: Sequence[int]) -> None:
         """Forget priorities for blocks whose cached contents were removed."""
+        discarded = set(block_ids)
+        dependent_keys = {
+            key
+            for block_id in discarded
+            for key in self._source_groups_by_block.get(block_id, ())
+        }
         affected_groups = {
             id(group): group
             for block_id in block_ids
             if (group := self._groups_by_block.get(block_id)) is not None
         }
         for group in affected_groups.values():
+            self._unindex_group_sources(group)
             key = frozenset(group.block_ids)
             self._pending_group_keys.discard(key)
             self._terminal_group_keys.discard(key)
@@ -747,10 +757,46 @@ class HotPrefixBlockEvictionSelector:
                 self._priorities.pop(grouped_block_id, None)
         for block_id in block_ids:
             self._priorities.pop(block_id, None)
+        # A descendant owns its segment blocks but STORE reads its entire path.
+        # Keep the segment's eviction priority while invalidating the old source
+        # binding before the ancestor block can be reused by another request.
+        for key in dependent_keys:
+            group = self._groups_by_block.get(next(iter(key)))
+            if group is None or frozenset(group.block_ids) != key:
+                continue
+            self._unindex_group_sources(group)
+            updated = replace(
+                group,
+                nodes=tuple(
+                    replace(node, full_block_ids=())
+                    if discarded.intersection(node.full_block_ids)
+                    else node
+                    for node in group.nodes
+                ),
+            )
+            for block_id in updated.block_ids:
+                self._groups_by_block[block_id] = updated
+            self._index_group_sources(updated)
         if affected_groups or block_ids:
             self._state_epoch += 1
         if self._discard_observer is not None:
             self._discard_observer(block_ids)
+
+    def _index_group_sources(self, group: EvictionGroup) -> None:
+        key = frozenset(group.block_ids)
+        for node in group.nodes:
+            for block_id in node.full_block_ids:
+                self._source_groups_by_block.setdefault(block_id, set()).add(key)
+
+    def _unindex_group_sources(self, group: EvictionGroup) -> None:
+        key = frozenset(group.block_ids)
+        for node in group.nodes:
+            for block_id in node.full_block_ids:
+                keys = self._source_groups_by_block.get(block_id)
+                if keys is not None:
+                    keys.discard(key)
+                    if not keys:
+                        self._source_groups_by_block.pop(block_id, None)
 
     def select_blocks(
         self,

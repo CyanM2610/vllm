@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
 import itertools
 import time
 from collections.abc import Sequence
@@ -55,6 +56,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.structured_trace import TraceCategory, get_structured_trace
 
 logger = init_logger(__name__)
 
@@ -175,6 +177,10 @@ class KVCacheManager:
         self.use_eagle = use_eagle
         self.log_stats = log_stats
         self.metrics_collector = metrics_collector
+        self._structured_trace = get_structured_trace(
+            source="vllm",
+            process_role="scheduler",
+        )
         # FIXME: make prefix cache stats conditional on log_stats. We still need
         # this comment because when the log stats is enabled there are still
         # potential configs we could expose in the future.
@@ -370,6 +376,17 @@ class KVCacheManager:
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
         if not self.prefix_cache_lookup_enabled(request):
+            if self._structured_trace.enabled:
+                self._structured_trace.emit(
+                    category=TraceCategory.CACHE_OBJECT,
+                    name="hbm.cache.lookup",
+                    request_id=request.request_id,
+                    attributes={
+                        "outcome": "skipped",
+                        "matched_tokens": 0,
+                        "block_ids_by_group": [],
+                    },
+                )
             return self.empty_kv_cache_blocks, 0, 0
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
@@ -463,6 +480,19 @@ class KVCacheManager:
                 tree=hotprefix_tree,
             )
             self._hotprefix_observed_request_ids.add(request.request_id)
+        if self._structured_trace.enabled:
+            with contextlib.suppress(Exception):
+                self._structured_trace.emit(
+                    category=TraceCategory.CACHE_OBJECT,
+                    name="hbm.cache.lookup",
+                    request_id=request.request_id,
+                    attributes={
+                        "outcome": ("hit" if num_new_computed_tokens > 0 else "miss"),
+                        "matched_tokens": num_new_computed_tokens,
+                        "shared_prefix_boundary": shared_prefix_boundary,
+                        "block_ids_by_group": blocks.get_block_ids(),
+                    },
+                )
         return blocks, num_new_computed_tokens, shared_prefix_boundary
 
     def get_computed_blocks_for_connector(
@@ -700,6 +730,17 @@ class KVCacheManager:
         try:
             self.block_pool.ensure_allocation_ready(num_blocks_to_allocate)
         except HotPrefixEvictionDeferred:
+            if self._structured_trace.enabled:
+                self._structured_trace.emit(
+                    category=TraceCategory.CACHE_OBJECT,
+                    name="hbm.allocation.deferred",
+                    request_id=request.request_id,
+                    attributes={
+                        "reason": "hotprefix_eviction_store",
+                        "required_blocks": num_blocks_to_allocate,
+                        "free_blocks": self.block_pool.get_num_free_blocks(),
+                    },
+                )
             return None
 
         if (
@@ -728,7 +769,17 @@ class KVCacheManager:
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
         if not self.enable_caching or delay_cache_blocks:
-            return self.create_kv_cache_blocks(new_blocks)
+            result = self.create_kv_cache_blocks(new_blocks)
+            self._trace_allocated_blocks(
+                request,
+                result,
+                num_new_tokens=num_new_tokens,
+                num_local_computed_tokens=num_local_computed_tokens,
+                num_external_computed_tokens=num_external_computed_tokens,
+                num_lookahead_tokens=num_lookahead_tokens,
+                cache_commit_delayed=delay_cache_blocks,
+            )
+            return result
 
         # NOTE(woosuk): We want to commit (cache) up to num_local_computed_tokens
         # + num_external_computed_tokens + num_new_tokens, but must exclude
@@ -741,7 +792,17 @@ class KVCacheManager:
         )
         self.cache_blocks(request, num_tokens_to_cache)
 
-        return self.create_kv_cache_blocks(new_blocks)
+        result = self.create_kv_cache_blocks(new_blocks)
+        self._trace_allocated_blocks(
+            request,
+            result,
+            num_new_tokens=num_new_tokens,
+            num_local_computed_tokens=num_local_computed_tokens,
+            num_external_computed_tokens=num_external_computed_tokens,
+            num_lookahead_tokens=num_lookahead_tokens,
+            cache_commit_delayed=False,
+        )
+        return result
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
@@ -751,7 +812,18 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        block_ids: tuple[list[int], ...] | tuple[()] = ()
+        if self._structured_trace.enabled:
+            with contextlib.suppress(Exception):
+                block_ids = self.get_block_ids(request.request_id)
         self.coordinator.free(request.request_id)
+        if self._structured_trace.enabled:
+            self._structured_trace.emit(
+                category=TraceCategory.CACHE_OBJECT,
+                name="hbm.blocks.request_released",
+                request_id=request.request_id,
+                attributes={"block_ids_by_group": block_ids},
+            )
         if request.is_finished():
             self._hotprefix_observed_request_ids.discard(request.request_id)
 
@@ -1068,7 +1140,9 @@ class KVCacheManager:
         free_blocks_before = len(free_ids)
         deferred_groups = selector.deferred_groups()
         page_size_bytes = self._hotprefix_page_size_bytes
+        rejected_groups = 0
         for group in deferred_groups:
+            retryable = False
             nodes = sorted(
                 (
                     node
@@ -1076,19 +1150,24 @@ class KVCacheManager:
                     if node.full_prefix
                     and node.full_block_ids
                     and len(node.full_prefix) % transfer_chunk_tokens == 0
-                    and node.prefix_id not in self._hotprefix_reserved_stores
                 ),
                 key=lambda node: (-len(node.full_prefix), node.prefix_id),
             )
             for node in nodes:
                 source_ids = node.full_block_ids
-                source_free_ids = set(source_ids) & free_ids
-                if len(free_ids) - len(source_free_ids) < min_free_blocks:
+                if len(source_ids) * group.block_size != len(node.full_prefix):
                     continue
                 source_blocks = [
                     self.block_pool.blocks[block_id] for block_id in source_ids
                 ]
                 if any(block.block_hash is None for block in source_blocks):
+                    continue
+                source_free_ids = set(source_ids) & free_ids
+                if (
+                    node.prefix_id in self._hotprefix_reserved_stores
+                    or len(free_ids) - len(source_free_ids) < min_free_blocks
+                ):
+                    retryable = True
                     continue
                 self.block_pool.touch(source_blocks)
                 self._hotprefix_reserved_stores.add(node.prefix_id)
@@ -1121,7 +1200,31 @@ class KVCacheManager:
                         )
                     )
                 return candidate
-        if self._hotprefix_observability_enabled:
+            if not retryable:
+                # No complete, aligned source can be admitted. Waiting for a
+                # transfer that was never submitted cannot make progress.
+                # deferred_groups excludes STOREs whose pins are still live.
+                selector.mark_group_terminal(group.block_ids)
+                rejected_groups += 1
+                if self._hotprefix_observability_enabled:
+                    self.hotprefix_observations.record(
+                        HotPrefixObservation(
+                            kind=HotPrefixEventKind.DECISION,
+                            stage=HotPrefixStage.EVICTION,
+                            action=HotPrefixAction.REJECT,
+                            outcome=HotPrefixOutcome.SKIPPED,
+                            reason=(
+                                HotPrefixReason.SOURCE_MISSING
+                                if nodes
+                                or any(not node.full_block_ids for node in group.nodes)
+                                else HotPrefixReason.UNALIGNED
+                            ),
+                            blocks=len(group.block_ids),
+                            free_blocks_before=free_blocks_before,
+                            free_blocks_after=self.block_pool.get_num_free_blocks(),
+                        )
+                    )
+        if self._hotprefix_observability_enabled and not rejected_groups:
             self.hotprefix_observations.record(
                 HotPrefixObservation(
                     kind=HotPrefixEventKind.DECISION,
@@ -1635,3 +1738,31 @@ class KVCacheManager:
             group_epoch=selector.state_epoch if selector is not None else 0,
             hotness_version=(local_frequency, local_clock),
         )
+
+    def _trace_allocated_blocks(
+        self,
+        request: Request,
+        result: KVCacheBlocks,
+        *,
+        num_new_tokens: int,
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+        num_lookahead_tokens: int,
+        cache_commit_delayed: bool,
+    ) -> None:
+        if not self._structured_trace.enabled:
+            return
+        with contextlib.suppress(Exception):
+            self._structured_trace.emit(
+                category=TraceCategory.CACHE_OBJECT,
+                name="hbm.blocks.allocated",
+                request_id=request.request_id,
+                attributes={
+                    "block_ids_by_group": result.get_block_ids(),
+                    "new_tokens": num_new_tokens,
+                    "local_computed_tokens": num_local_computed_tokens,
+                    "external_computed_tokens": num_external_computed_tokens,
+                    "lookahead_tokens": num_lookahead_tokens,
+                    "cache_commit_delayed": cache_commit_delayed,
+                },
+            )

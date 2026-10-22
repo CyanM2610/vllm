@@ -604,6 +604,9 @@ class BlockPool:
             ):
                 removed_hashes.append(block_hash)
         block.reset_hash()
+        discard_fn = getattr(self.eviction_selector, "discard", None)
+        if discard_fn is not None:
+            discard_fn((block.block_id,))
         return removed_hashes
 
     def _emit_block_removed_events(
@@ -790,9 +793,6 @@ class BlockPool:
             return False
 
         self._emit_block_removed_events(evicted_hashes)
-        discard_fn = getattr(self.eviction_selector, "discard", None)
-        if discard_fn is not None:
-            discard_fn((block.block_id,))
         return True
 
     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
@@ -892,6 +892,10 @@ class BlockPool:
         # Remove all hashes from all blocks.
         for block in self.blocks:
             block.reset_hash()
+
+        discard_fn = getattr(self.eviction_selector, "discard", None)
+        if discard_fn is not None:
+            discard_fn(tuple(block.block_id for block in self.blocks))
 
         if self.metrics_collector:
             self.metrics_collector.reset()
