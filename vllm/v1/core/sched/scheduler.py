@@ -38,6 +38,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.retirement_observation import notify_retirement, retirement_call
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -498,6 +499,7 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    @retirement_call("schedule")
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -1402,6 +1404,7 @@ class Scheduler(SchedulerInterface):
 
         return new_block_ids_to_zero or None
 
+    @retirement_call("preempt")
     def _preempt_request(
         self, request: Request, timestamp: float, drop_stale_output: bool = False
     ) -> None:
@@ -1799,6 +1802,7 @@ class Scheduler(SchedulerInterface):
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
+    @retirement_call("consume")
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -1889,6 +1893,13 @@ class Scheduler(SchedulerInterface):
 
             # Drop-mode stale output (same-step resume) is discarded entirely.
             if output_is_stale and request.drop_stale_output:
+                notify_retirement(
+                    "stale_drop",
+                    self,
+                    request_id=req_id,
+                    scheduled_tokens=num_tokens_scheduled,
+                    model_runner_output=model_runner_output,
+                )
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
@@ -2519,6 +2530,7 @@ class Scheduler(SchedulerInterface):
         logger.info("setting pause state to %s", pause_state.name)
         self._pause_state = pause_state
 
+    @retirement_call("free_request")
     def _free_request_blocks(self, request: Request):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
@@ -2545,6 +2557,7 @@ class Scheduler(SchedulerInterface):
             return
         self.deferred_frees.append((fence_seq, blocks[::-1]))
 
+    @retirement_call("drain_frees")
     def _drain_deferred_frees(self):
         """Return deferred blocks whose fence step has completed.
 

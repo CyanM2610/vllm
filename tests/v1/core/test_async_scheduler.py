@@ -701,7 +701,7 @@ def test_requires_kv_delivery_defaults_to_producer_role():
         assert scheduler.requires_kv_delivery is expected, role
 
 
-@pytest.mark.parametrize("kv_role", ["kv_producer", "kv_consumer"])
+@pytest.mark.parametrize("kv_role", ["kv_producer", "kv_consumer", "kv_both"])
 def test_kv_pressure_preempt_mid_handoff(kv_role: str):
     """P/D race: a request is KV-pressure preempted while the output of its
     final prefill chunk -- the hand-off token that would finish it -- is in
@@ -712,7 +712,7 @@ def test_kv_pressure_preempt_mid_handoff(kv_role: str):
     already freed, so the consumer pulls garbage. A consumer hands nothing off,
     so it keeps the lossless deliver-stale path.
     """
-    is_producer = kv_role == "kv_producer"
+    is_producer = kv_role in ("kv_producer", "kv_both")
     scheduler = create_scheduler(
         async_scheduling=True,
         use_kv_connector=True,
@@ -743,7 +743,23 @@ def test_kv_pressure_preempt_mid_handoff(kv_role: str):
     assert handoff.num_stale_output_tokens == handoff.num_prompt_tokens
     assert handoff.drop_stale_output is is_producer
 
-    scheduler.update_from_output(sched_output, _make_model_runner_output(sched_output))
+    model_output = _make_model_runner_output(sched_output)
+    if is_producer:
+        # A discarded output must not require a valid sampled-output index.
+        model_output.req_id_to_index.pop(handoff.request_id)
+    from vllm.v1.core.retirement_observation import set_retirement_observer
+
+    def observe(name, owner, **fields):
+        if name == "stale_drop":
+            output = fields["model_runner_output"]
+            output.req_id_to_index[fields["request_id"]]
+
+    if kv_role == "kv_both":
+        set_retirement_observer(observe)
+    try:
+        scheduler.update_from_output(sched_output, model_output)
+    finally:
+        set_retirement_observer(None)
 
     assert handoff.num_stale_output_tokens == 0
     if is_producer:
