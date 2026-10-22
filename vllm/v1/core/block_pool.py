@@ -261,13 +261,15 @@ class BlockPool:
         )
 
     def reserve_external_prefix(
-        self, prefix: ExternalPrefix, max_new_blocks: int
+        self, prefix: ExternalPrefix, max_new_blocks: int, *, min_free_blocks: int = 0
     ) -> ExternalPrefixReservation | None:
         """Pin a cached prefix and allocate its suffix with native LRU victims.
 
         Args:
             prefix: Native snapshot for group 0 of one dense attention group.
             max_new_blocks: Maximum number of newly allocated HBM blocks.
+            min_free_blocks: Free-block headroom retained after this reservation.
+                Rechecked here after any intervening frontend allocation.
         Returns:
             Independent ownership, or None for full hit/budget/capacity rejection.
             Rejection leaves references, hashes and eviction order unchanged.
@@ -283,6 +285,7 @@ class BlockPool:
             or not prefix.block_hashes
             or len(prefix.token_ids) != len(prefix.block_hashes) * prefix.block_size
             or max_new_blocks < 0
+            or min_free_blocks < 0
         ):
             raise ValueError("invalid external prefix or block budget")
         cached: list[KVCacheBlock] = []
@@ -296,7 +299,7 @@ class BlockPool:
         if (
             new_count == 0
             or new_count > max_new_blocks
-            or new_count > self.get_num_free_blocks() - free_cached
+            or new_count + min_free_blocks > self.get_num_free_blocks() - free_cached
         ):
             return None
         self.touch(cached)
