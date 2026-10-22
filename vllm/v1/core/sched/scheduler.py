@@ -847,8 +847,11 @@ class Scheduler(SchedulerInterface):
                         hit_diverged,
                     ) = self._get_local_prefix_cache_hit(request)
 
-                    wait_emit("hbm_match", request.request_id,
-                              hit_tokens=num_new_local_computed_tokens)
+                    wait_emit(
+                        "hbm_match",
+                        request.request_id,
+                        hit_tokens=num_new_local_computed_tokens,
+                    )
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
                         # Present a block-aligned local hit to the connector so
@@ -864,8 +867,12 @@ class Scheduler(SchedulerInterface):
                             )
                         )
 
-                        wait_emit("lower_match_poll", request.request_id,
-                                  external_tokens=ext_tokens, async_load=load_kv_async)
+                        wait_emit(
+                            "lower_match_poll",
+                            request.request_id,
+                            external_tokens=ext_tokens,
+                            async_load=load_kv_async,
+                        )
                         if ext_tokens is None:
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
@@ -1104,10 +1111,15 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.free(request)
                     break
 
-                wait_emit("target_reserved", request.request_id,
-                          external_tokens=num_external_computed_tokens,
-                          async_load=load_kv_async,
-                          block_ids=self.kv_cache_manager.get_blocks(request_id).get_block_ids())
+                wait_emit(
+                    "target_reserved",
+                    request.request_id,
+                    external_tokens=num_external_computed_tokens,
+                    async_load=load_kv_async,
+                    block_ids=self.kv_cache_manager.get_blocks(
+                        request_id
+                    ).get_block_ids(),
+                )
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
                 # This information is used to determine if a load is
@@ -1392,9 +1404,14 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
-        wait_emit("schedule_output", tokens=dict(num_scheduled_tokens),
-                  waiting=len(self.waiting), running=len(self.running),
-                  free_blocks=self.kv_cache_manager.block_pool.get_num_free_blocks())
+        wait_emit(
+            "schedule_output",
+            tokens=dict(num_scheduled_tokens),
+            waiting=len(self.waiting),
+            running=len(self.running),
+            free_blocks=self.kv_cache_manager.block_pool.get_num_free_blocks(),
+            preempted=list(scheduler_output.preempted_req_ids or ()),
+        )
         for wait_rid, wait_tokens in num_scheduled_tokens.items():
             wait_once("first_schedule", wait_rid, tokens=wait_tokens)
         return scheduler_output
@@ -2414,10 +2431,17 @@ class Scheduler(SchedulerInterface):
         return self.kv_cache_manager.usage
 
     def add_request(self, request: Request) -> None:
-        wait_emit("input_known", request.request_id,
-                  prompt_tokens=request.num_prompt_tokens,
-                  logical_id=(request.sampling_params.extra_args or {}).get("native_token_replay_id") if request.sampling_params else None,
-                  block_hashes=[str(h) for h in request.block_hashes])
+        wait_emit(
+            "input_known",
+            request.request_id,
+            prompt_tokens=request.num_prompt_tokens,
+            logical_id=(request.sampling_params.extra_args or {}).get(
+                "native_token_replay_id"
+            )
+            if request.sampling_params
+            else None,
+            block_hashes=[str(h) for h in request.block_hashes],
+        )
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
@@ -2887,7 +2911,9 @@ class Scheduler(SchedulerInterface):
             if request.num_computed_tokens == request.num_tokens:
                 request.num_computed_tokens = request.num_tokens - 1
 
-        wait_emit("kv_published", request.request_id, tokens=request.num_computed_tokens)
+        wait_emit(
+            "kv_published", request.request_id, tokens=request.num_computed_tokens
+        )
         self.finished_recving_kv_req_ids.remove(request.request_id)
 
     def _try_promote_blocked_waiting_request(self, request: Request) -> bool:
