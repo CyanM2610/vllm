@@ -29,6 +29,12 @@ def state(request):
 
 def mark(scheduler,request,reason,**fields):
     scheduler._compute_probe_decisions[request.request_id]=dict(reason=reason,**fields)
+    emit("compute_native_check", request.request_id,
+         batch_id=f"{os.getpid()}:{scheduler.current_step}",
+         reason=reason, state=state(request),
+         free_blocks=scheduler.kv_cache_manager.block_pool.get_num_free_blocks(),
+         slots_remaining=scheduler.max_num_running_reqs-len(scheduler.running),
+         **fields)
 
 
 def scheduled(function):
@@ -45,7 +51,16 @@ def scheduled(function):
              max_num_seqs=self.max_num_running_reqs,free_blocks=pool.get_num_free_blocks(),
              total_blocks=pool.num_gpu_blocks,chunk_threshold=self.scheduler_config.long_prefill_token_threshold,
              chunked_prefill=self.scheduler_config.enable_chunked_prefill,
-             reserve_full_isl=self.scheduler_reserve_full_isl)
+             reserve_full_isl=self.scheduler_reserve_full_isl,
+             native_constraints=dict(
+                 pause_state=self._pause_state.name,
+                 max_model_len=self.max_model_len,
+                 sampled_tokens_per_step=self.num_sampled_tokens_per_step,
+                 speculative=self.vllm_config.speculative_config is not None,
+                 mamba_alignment=self.need_mamba_block_aligned_split,
+                 prefill_lookahead=self.num_prefill_lookahead,
+                 lora=self.lora_config is not None,
+                 throttle_prefills=bool(args[0] if args else kwargs.get("throttle_prefills",False))))
         output=function(self,*args,**kwargs)
         # Single-GPU UniProc passes this object by identity; verify at worker.
         output._compute_probe_id=bid
