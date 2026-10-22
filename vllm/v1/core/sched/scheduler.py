@@ -1618,7 +1618,16 @@ class Scheduler(SchedulerInterface):
             def defer_waiting_request():
                 if not restore_only:
                     request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
+                    if action_feedback and request_queue is self.skipped_waiting:
+                        # Native dependency skips and policy skips can interleave
+                        # in this queue. Restore their shared encounter order,
+                        # not two separately prepended groups. New native skips
+                        # from WAITING still use the original destination below.
+                        entry = policy_held_queues.setdefault(
+                            id(request_queue), (request_queue, []))
+                        entry[1].append(request)
+                    else:
+                        step_skipped_waiting.prepend_request(request)
 
             mark(request, "waiting_visited")
             # try to promote blocked statuses while traversing skipped queue.
