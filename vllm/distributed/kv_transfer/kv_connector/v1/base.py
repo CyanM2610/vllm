@@ -350,6 +350,15 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def submit_control(self) -> None:
+        """Submit independent controls after forward, including empty steps.
+
+        The V2 GPU runner calls this after ordinary stores and before polling
+        completions. Controls must report through worker metadata, not through
+        frontend finished request IDs. The default connector has no controls.
+        """
+        return None
+
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:

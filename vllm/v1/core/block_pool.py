@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -29,6 +30,34 @@ from vllm.v1.core.retirement_observation import retirement_call
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class ExternalPrefix:
+    """Snapshot of an observed, text-only prefix in native hash geometry.
+
+    Construct with ``BlockPool.snapshot_external_prefix``. No Request reference
+    or future output tokens are retained. The first version supports group 0
+    of a single dense attention cache, without salt, LoRA or prompt embeddings.
+    """
+
+    token_ids: tuple[int, ...]
+    block_hashes: tuple[BlockHash, ...]
+    block_size: int
+
+
+@dataclass(frozen=True, eq=False)
+class ExternalPrefixReservation:
+    """Independent HBM ownership; identity is local to the allocating pool.
+
+    Only ``block_ids[num_cached_blocks:]`` may be overwritten by the LOAD.
+    Until publication those targets are invisible to prefix lookup. The caller
+    must establish terminal physical completion before publishing or releasing
+    a submitted copy, including after cancellation or a transport failure.
+    """
+
+    block_ids: tuple[int, ...]
+    num_cached_blocks: int
 
 
 class BlockHashToBlockMap:
@@ -195,6 +224,140 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        self._external_prefix_reservations: dict[
+            ExternalPrefixReservation, tuple[ExternalPrefix, list[KVCacheBlock]]
+        ] = {}
+
+    def snapshot_external_prefix(
+        self, request: Request, num_tokens: int
+    ) -> ExternalPrefix:
+        """Copy a known native prefix without retaining frontend ownership.
+
+        Args:
+            request: An actual observed request with native block hashes.
+            num_tokens: Positive whole-block prefix length already known.
+        Returns:
+            An immutable snapshot for a single dense KV group.
+        Raises:
+            ValueError: Unsupported input or incomplete native hash coverage.
+        """
+        if (
+            not self.enable_caching
+            or num_tokens <= 0
+            or num_tokens % self.hash_block_size
+            or num_tokens > len(request.all_token_ids)
+            or request.mm_features
+            or request.lora_request is not None
+            or request.prompt_embeds is not None
+            or request.cache_salt
+        ):
+            raise ValueError("external prefix requires unsalted plain-text full blocks")
+        count = num_tokens // self.hash_block_size
+        hashes = tuple(request.block_hashes[:count])
+        if len(hashes) != count:
+            raise ValueError("external prefix lacks complete native hashes")
+        return ExternalPrefix(
+            tuple(request.all_token_ids[:num_tokens]), hashes, self.hash_block_size
+        )
+
+    def reserve_external_prefix(
+        self, prefix: ExternalPrefix, max_new_blocks: int
+    ) -> ExternalPrefixReservation | None:
+        """Pin a cached prefix and allocate its suffix with native LRU victims.
+
+        Args:
+            prefix: Native snapshot for group 0 of one dense attention group.
+            max_new_blocks: Maximum number of newly allocated HBM blocks.
+        Returns:
+            Independent ownership, or None for full hit/budget/capacity rejection.
+            Rejection leaves references, hashes and eviction order unchanged.
+        Raises:
+            ValueError: Invalid snapshot geometry or budget.
+        Notes:
+            Scheduler-thread only. Count cached free pages before touching them,
+            so the suffix cannot consume or evict its own cached prefix.
+        """
+        if (
+            not self.enable_caching
+            or prefix.block_size != self.hash_block_size
+            or not prefix.block_hashes
+            or len(prefix.token_ids) != len(prefix.block_hashes) * prefix.block_size
+            or max_new_blocks < 0
+        ):
+            raise ValueError("invalid external prefix or block budget")
+        cached: list[KVCacheBlock] = []
+        for block_hash in prefix.block_hashes:
+            hit = self.get_cached_block(block_hash, [0])
+            if hit is None:
+                break
+            cached.append(hit[0])
+        new_count = len(prefix.block_hashes) - len(cached)
+        free_cached = sum(block.ref_cnt == 0 for block in cached)
+        if (
+            new_count == 0
+            or new_count > max_new_blocks
+            or new_count > self.get_num_free_blocks() - free_cached
+        ):
+            return None
+        self.touch(cached)
+        blocks = cached + self.get_new_blocks(new_count)
+        reservation = ExternalPrefixReservation(
+            tuple(block.block_id for block in blocks), len(cached)
+        )
+        self._external_prefix_reservations[reservation] = (prefix, blocks)
+        return reservation
+
+    def finish_external_prefix(
+        self, reservation: ExternalPrefixReservation, *, publish: bool
+    ) -> None:
+        """Consume a reservation once, after terminal completion or before submit.
+
+        Args:
+            reservation: Handle returned by this pool; never a frontend lease.
+            publish: True only for a successful, uncancelled terminal copy.
+        Raises:
+            ValueError: Foreign/already-consumed handle or targets lost ownership.
+        Notes:
+            Failure/cancellation releases targets without publishing hashes.
+            Native reverse-order free preserves the usual tail-first LRU order.
+        """
+        owned = self._external_prefix_reservations.get(reservation)
+        if owned is None:
+            raise ValueError("unknown or consumed external prefix reservation")
+        prefix, blocks = owned
+        start = reservation.num_cached_blocks
+        if any(not self.is_block_writable(block) for block in blocks[start:]):
+            raise ValueError("external prefix target lost exclusive ownership")
+        if publish:
+            hashes = prefix.block_hashes
+            for index in range(start, len(blocks)):
+                self._insert_block_hash(
+                    make_block_hash_with_group_id(hashes[index], 0),
+                    blocks[index],
+                    num_tokens=(index + 1) * prefix.block_size,
+                )
+            if self.enable_kv_cache_events:
+                self.kv_event_queue.append(
+                    BlockStored(
+                        block_hashes=[
+                            maybe_convert_block_hash(h) for h in hashes[start:]
+                        ],
+                        parent_block_hash=(
+                            maybe_convert_block_hash(hashes[start - 1])
+                            if start
+                            else None
+                        ),
+                        token_ids=list(prefix.token_ids[start * prefix.block_size :]),
+                        block_size=prefix.block_size,
+                        lora_id=None,
+                        medium=MEDIUM_GPU,
+                        lora_name=None,
+                        extra_keys=[None] * (len(blocks) - start),
+                        group_idx=0,
+                    )
+                )
+        self.free_blocks(reversed(blocks))
+        del self._external_prefix_reservations[reservation]
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]

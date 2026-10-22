@@ -100,6 +100,8 @@ class ActiveKVConnector(KVConnector):
         if wait_for_save:
             with phase_span("kv_wait_for_save"):
                 self.kv_connector.wait_for_save()
+        with phase_span("kv_submit_control"):
+            self.kv_connector.submit_control()
         with phase_span("kv_get_finished"):
             output.finished_sending, output.finished_recving = (
                 self.kv_connector.get_finished(finished_req_ids)
