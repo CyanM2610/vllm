@@ -390,10 +390,16 @@ class Scheduler(SchedulerInterface):
         self._init_prefill_operations()
 
     def _init_prefill_operations(self) -> None:
+        config = self.vllm_config.kv_transfer_config
+        extra = (config.kv_connector_extra_config or {}) if config else {}
+        enabled = extra.get("lmcache.mp.action_feedback", False)
+        if type(enabled) is not bool:
+            raise ValueError("lmcache.mp.action_feedback must be bool")
+        self._action_feedback = None
         self._decoupled_control = bool(
             getattr(self.connector, "decoupled_control_enabled", False)
         )
-        self._prefill_operations_enabled = self._decoupled_control or bool(
+        self._prefill_operations_enabled = enabled or self._decoupled_control or bool(
             getattr(self.connector, "decoupled_store_enabled", False)
         )
         if not self._prefill_operations_enabled:
@@ -447,8 +453,203 @@ class Scheduler(SchedulerInterface):
         self._operation_budget = self.max_num_scheduled_tokens
         self._operation_input_budget = self.scheduler_config.max_num_batched_tokens
         self._operation_decider = NativeOperationDecider()
+        if enabled:
+            from vllm.v1.core.sched.prefill_operations import ActionFeedback
+            from vllm.v1.core.sched.global_sjf_input import frozen_config_scope
+            from vllm.v1.core.sched.compute_cost import ComputeCostModel
+
+            _, errors = frozen_config_scope(self.vllm_config, self.block_size)
+            if (errors or self.max_num_scheduled_tokens != 2048
+                    or getattr(self, "_global_sjf_input_enabled", False)
+                    or getattr(self, "_conditional_end_enabled", False)):
+                raise ValueError("action feedback requires frozen P-only 2048 scope: " + repr(errors))
+            model = self.vllm_config.model_config
+            ComputeCostModel.from_config(getattr(model, "hf_text_config", None) or model.hf_config)
+            self._action_feedback = ActionFeedback(self._operation_limit, self._emit_action_feedback)
+            self._action_attempts = {}
+            self._action_compute = {}
+            self._action_loads = {}
+            self._action_deferred_frees = {}
+            self._action_native_receipts = OrderedDict()
+            self._action_legacy_decider = False
+            self.connector.set_operation_feedback_observer(self._connector_action_feedback)
         if self.connector.decoupled_store_enabled:
             self.connector.set_operation_decider(self._decide_store_operation)
+
+    def _check_action_entry(self):
+        feedback = getattr(self, "_action_feedback", None)
+        if feedback is not None:
+            feedback.check_entry()
+
+    def set_prefill_action_policy(self, policy=None):
+        """Trusted synchronous policy; immutable views, no native ownership handles.
+
+        decide(step, candidate) returns OperationAction. Optional on_feedback
+        observes native transitions and may only update policy-owned state.
+        None restores the native fast path without constructing snapshots.
+        """
+        self._check_action_entry()
+        if self._action_feedback is None:
+            raise RuntimeError("lmcache.mp.action_feedback is disabled")
+        if policy is not None and not callable(getattr(policy, "decide", None)):
+            raise TypeError("action policy must implement decide")
+        self._action_feedback.policy = policy
+        self._action_legacy_decider = False
+
+    def get_prefill_action_feedback(self):
+        """Bounded scalar history and CPU samples; no polling or ownership handles."""
+        if self._action_feedback is None:
+            raise RuntimeError("lmcache.mp.action_feedback is disabled")
+        return tuple(self._action_feedback.history)
+
+    def _emit_action_feedback(self, feedback):
+        from dataclasses import asdict
+        fields = asdict(feedback)
+        request_id = fields.pop("request_id")
+        fields["result"] = feedback.result.value
+        wait_emit("prefill_operation_feedback", request_id, **fields)
+
+    def _action_attempt(self, request, kind, start=None, end=None, *, renew=False):
+        feedback = self._action_feedback
+        evidence = feedback.attempt(request.request_id, kind, start, end, renew=renew)
+        self._action_attempts[(request.request_id, kind)] = evidence
+        return evidence
+
+    def _action_blocked(self, request, kind, reason):
+        from vllm.v1.core.sched.prefill_operations import ResultKind
+        evidence = self._action_attempts.get((request.request_id, kind))
+        if evidence is None:
+            evidence = self._action_attempt(request, kind)
+        self._action_feedback.report(evidence, ResultKind.BLOCKED, reason=reason)
+
+    def _action_selected(self, request, p, quota, branch, grant=None):
+        from vllm.v1.core.sched.prefill_operations import ResultKind
+        evidence = self._action_attempts.get((request.request_id, "compute"))
+        if evidence is None:
+            evidence = self._action_attempt(request, "compute", p, p + quota)
+        identity = f"{evidence.operation_id}:compute:{self.current_step}"
+        def commit(feedback):
+            if grant is not None:
+                self._compute_budget_commit(grant, branch)
+        selected = self._action_feedback.report(
+            evidence, ResultKind.SELECTED, commitment_id=identity,
+            start_token=p, end_token=p + quota, granted_tokens=quota,
+            native_phase=branch, effect=commit,
+        )
+        if selected is not None:
+            self._action_compute[(self.current_step, request.request_id)] = selected
+
+    def _action_revoke(self, request_id):
+        from vllm.v1.core.sched.prefill_operations import ResultKind
+        evidence = self._action_compute.pop((self.current_step, request_id), None)
+        if evidence is not None:
+            def revoke(feedback):
+                if getattr(self, "_compute_budget", None) is not None:
+                    self._compute_budget_revoke(request_id)
+            self._action_feedback.report(
+                evidence, ResultKind.REVOKED, reason="native_same_step_rollback", effect=revoke)
+
+    def _action_load_reserved(self, request, start, end):
+        from vllm.v1.core.sched.prefill_operations import ResultKind
+        evidence = self._action_attempts.get((request.request_id, "load"))
+        if evidence is None:
+            evidence = self._action_attempt(request, "load", start, end)
+        identity = f"{evidence.operation_id}:load"
+        acquired = self._action_feedback.report(
+            evidence, ResultKind.RESOURCES_ACQUIRED, commitment_id=identity,
+            start_token=start, end_token=end, native_phase="target_reserved",
+        )
+        if acquired is not None:
+            self._action_loads[request.request_id] = acquired
+
+    def _action_load_transition(self, request_id, result, **fields):
+        if self._action_feedback is None:
+            return
+        evidence = self._action_loads.get(request_id)
+        if evidence is not None:
+            updated = self._action_feedback.report(evidence, result, **fields)
+            if updated is not None:
+                self._action_loads[request_id] = updated
+
+    def _connector_action_feedback(self, view, result, **fields):
+        """Called only at native connector transitions, never polls or matches."""
+        from vllm.v1.core.sched.prefill_operations import ResultKind
+        feedback = self._action_feedback
+        if feedback is None:
+            return
+        kind, rid, identity = view["kind"], view["request_id"], view["operation_id"]
+        if kind == "load":
+            fields.update(transfer_start_token=view.get("start_token"),
+                          transfer_end_token=view.get("end_token"),
+                          skip_first_n_tokens=view.get("skip_first_n_tokens"))
+            self._action_load_transition(rid, ResultKind(result), **fields)
+            return
+        evidence = feedback.find(rid, kind, commitment_id=identity)
+        if evidence is None:
+            evidence = feedback.attempt(
+                rid, kind, view.get("start_token"), view.get("end_token"), operation_id=identity)
+        feedback.report(evidence, ResultKind(result), commitment_id=identity, **fields)
+
+    def _action_request_pending(self, request, reason):
+        from vllm.v1.core.sched.prefill_operations import ResultKind
+        if self._action_feedback is not None:
+            evidence = self._action_feedback.find(request.request_id, "lifetime")
+            if evidence is None:
+                evidence = self._action_attempt(request, "lifetime", 0, request.num_prompt_tokens)
+            self._action_feedback.report(
+                evidence, ResultKind.CANCEL_PENDING,
+                commitment_id=evidence.commitment_id or f"{evidence.operation_id}:release",
+                reason=reason, native_phase="native_delayed_release",
+            )
+
+    def _action_request_released(self, request_id):
+        from vllm.v1.core.sched.prefill_operations import ResultKind
+        feedback = self._action_feedback
+        if feedback is None:
+            return
+        evidence = feedback.find(request_id, "lifetime")
+        if evidence is None:
+            evidence = feedback.attempt(request_id, "lifetime")
+        feedback.report(evidence, ResultKind.ENDED,
+                        commitment_id=evidence.commitment_id or f"{evidence.operation_id}:release",
+                        native_phase="native_hbm_blocks_released",
+                        resource_obligation="HBM released; lower_source_cleanup_is_separate")
+        load = self._action_loads.pop(request_id, None)
+        if load is not None:
+            feedback.report(load, ResultKind.ENDED, native_phase="native_request_release")
+
+    def _action_stores_finished(self, request_id):
+        from vllm.v1.core.sched.prefill_operations import ResultKind
+        feedback = self._action_feedback
+        # Native finished_sending is the aggregate fence for immediate STORE.
+        # Retained STOREs normally retired through their exact worker receipts.
+        for identity in tuple(feedback.by_request.get((request_id, "store"), ())):
+            evidence = feedback.find(request_id, "store", commitment_id=identity)
+            for result in (ResultKind.COMPLETION, ResultKind.ADOPTED, ResultKind.ENDED):
+                feedback.report(evidence, result, native_phase="native_finished_sending_aggregate")
+
+    def _action_duplicate_native_receipt(self, direction, request_id):
+        """Deduplicate known native receipts; unknown identities stay native errors.
+
+        Native finished sets carry request IDs, not DMA epochs. This does not
+        extend their protocol to arbitrary stale replies after ID reuse.
+        """
+        key = (direction, request_id)
+        load = self._action_loads.get(request_id) if direction == "recv" else None
+        request = self.requests.get(request_id)
+        identity = load.commitment_id if load else (id(request) if request is not None else None)
+        previous = self._action_native_receipts.get(key)
+        if previous is not None and (identity is None or previous == identity):
+            return True, identity
+        return False, identity
+
+    def _action_record_native_receipt(self, direction, request_id, identity):
+        # Commit deduplication only after native adoption/release succeeds.
+        # An exception must not make a later delivery silently skip cleanup.
+        if identity is not None:
+            self._action_native_receipts[(direction, request_id)] = identity
+            while len(self._action_native_receipts) > self._operation_limit:
+                self._action_native_receipts.popitem(last=False)
 
     def _register_operation_request(self, request: Request) -> None:
         if getattr(self, "_decoupled_control", False):
@@ -487,16 +688,22 @@ class Scheduler(SchedulerInterface):
             self._operation_input_budget,
             self.kv_cache_manager.block_pool.get_num_free_blocks(),
             self._inflight_prefill_reserved_blocks(),
-            tuple(self._step_operations),
+            tuple(self._step_operations[-self._operation_limit:])
+            if self._action_feedback is not None and not self._action_legacy_decider
+            else tuple(self._step_operations),
             tuple(connector_views),
         )
 
     def set_prefill_operation_decider(self, decider) -> None:
+        self._check_action_entry()
         if not getattr(self, "_prefill_operations_enabled", False):
             raise RuntimeError("decoupled control is disabled")
         if not callable(getattr(decider, "decide", None)):
             raise TypeError("operation decider must provide decide(step, candidate)")
         self._operation_decider = decider
+        if self._action_feedback is not None:
+            self._action_legacy_decider = True
+            self._action_feedback.policy = None
 
     def _decide_store_operation(self, candidate):
         from vllm.v1.core.sched.prefill_operations import OperationDecision, OperationView
@@ -513,6 +720,20 @@ class Scheduler(SchedulerInterface):
             resources=tuple(candidate.get("resources", ())),
         )
         self._step_operations.append(view)
+        if self._action_feedback is not None and not self._action_legacy_decider:
+            del self._step_operations[:-self._operation_limit]
+        if self._action_feedback is not None and not self._action_legacy_decider:
+            from vllm.v1.core.sched.prefill_operations import ActionKind, ResultKind
+            action = self._action_feedback.decide(view, self.get_prefill_operation_step_view)
+            if action.kind == ActionKind.KEEP_RETAINED_STORE:
+                evidence = self._action_feedback.find(view.request_id, "store", commitment_id=view.operation_id)
+                if evidence is not None:
+                    # A per-step choice, not another acquisition of source pages.
+                    attempt = self._action_feedback.attempt(view.request_id, "store_choice",
+                                                           view.start_token, view.end_token)
+                    self._action_feedback.report(attempt, ResultKind.NOT_ATTEMPTED,
+                                                 reason="keep_retained_store")
+            return "defer" if action.kind in (ActionKind.RETAIN_STORE, ActionKind.KEEP_RETAINED_STORE) else "submit"
         decision = self._operation_decider.decide(
             self.get_prefill_operation_step_view(), view
         )
@@ -552,6 +773,8 @@ class Scheduler(SchedulerInterface):
             in_flight_tokens=request.num_in_flight_tokens,
         )
         self._step_operations.append(view)
+        if self._action_feedback is not None and not self._action_legacy_decider:
+            del self._step_operations[:-self._operation_limit]
         wait_emit(
             "prefill_operation", request.request_id, step=self.current_step,
             operation_id=view.operation_id, operation=kind, stage=stage,
@@ -572,6 +795,14 @@ class Scheduler(SchedulerInterface):
                           ("capacity_acquired", "unknown"),
                           ("physical_inputs_ready", "unknown")), proposed=proposed,
         )
+        if self._action_feedback is not None and not self._action_legacy_decider:
+            from vllm.v1.core.sched.prefill_operations import ActionKind, ResultKind
+            evidence = self._action_attempt(request, kind, start, end, renew=True)
+            action = self._action_feedback.decide(view, self.get_prefill_operation_step_view)
+            if action.kind != ActionKind.ATTEMPT:
+                self._action_feedback.report(evidence, ResultKind.NOT_ATTEMPTED,
+                                             reason=action.kind.value)
+            return action
         decision = self._operation_decider.decide(
             self.get_prefill_operation_step_view(), view
         )
@@ -599,6 +830,9 @@ class Scheduler(SchedulerInterface):
         ):
             raise ValueError("decoupled control requires native request ordering")
         self._step_operations = []
+        if self._action_feedback is not None:
+            self._action_feedback.begin(self.current_step)
+            self._action_attempts.clear()
         self._operation_budget = self.max_num_scheduled_tokens
         self._operation_input_budget = self.scheduler_config.max_num_batched_tokens
         if not self._decoupled_control:
@@ -657,7 +891,9 @@ class Scheduler(SchedulerInterface):
                 request, "lookup", 0, request.num_prompt_tokens,
                 self._operation_budget, self._operation_input_budget,
             )
-            if decision is None:
+            from vllm.v1.core.sched.prefill_operations import OperationAction, ActionKind
+            if decision is None or (isinstance(decision, OperationAction)
+                                    and decision.kind != ActionKind.ATTEMPT):
                 continue
             self.connector.prepare_lookup_operation(request)
             state = self.connector.lookup_operation_state(request.request_id)
@@ -906,6 +1142,7 @@ class Scheduler(SchedulerInterface):
     @compute_scheduled
     @retirement_call("schedule")
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        self._check_action_entry()
         self.current_step += 1
         wait_emit("schedule_begin", step=self.current_step)
         # NOTE(woosuk) on the scheduling algorithm:
@@ -974,6 +1211,9 @@ class Scheduler(SchedulerInterface):
         # First, schedule the RUNNING requests.
         global_order = getattr(self, "_global_sjf_input_enabled", False)
         step_skipped_waiting = create_request_queue(self.policy)
+        action_feedback = getattr(self, "_action_feedback", None) is not None
+        policy_skipped = set()
+        policy_held_queues = {}
         scheduled_loras: set[int] = set()
         req_index = 0
         ledger = None
@@ -983,6 +1223,15 @@ class Scheduler(SchedulerInterface):
 
         def mark(request, reason, **fields):
             compute_mark(self, request, reason, **fields)
+            if action_feedback and reason in (
+                "lookup_pending", "blocked_waiting_dependency", "stale_output_pending",
+                "waiting_allocation_failed", "running_allocation_failed", "native_zero_quota",
+                "output_limit_guard", "operation_max_num_seqs",
+            ):
+                kind = "load" if active_branch == "restore_control" or request.status == RequestStatus.WAITING_FOR_REMOTE_KVS else "compute"
+                if (request.request_id, "load") in self._action_attempts:
+                    kind = "load"
+                self._action_blocked(request, kind, reason)
             if decoupled_control and reason in (
                 "lookup_pending", "blocked_waiting_dependency",
                 "stale_output_pending", "waiting_allocation_failed",
@@ -1162,7 +1411,8 @@ class Scheduler(SchedulerInterface):
                 conditional_stop = True
                 return False
 
-            if decoupled_control:
+            action_end_after_commit = False
+            if decoupled_control or action_feedback:
                 quota = self._decide_operation(
                     request, "compute", request.num_computed_tokens,
                     request.num_computed_tokens + num_new_tokens,
@@ -1171,13 +1421,30 @@ class Scheduler(SchedulerInterface):
                 if quota is None:
                     req_index += 1
                     return True
-                num_new_tokens = quota
+                from vllm.v1.core.sched.prefill_operations import OperationAction, ActionKind
+                if isinstance(quota, OperationAction):
+                    if quota.kind == ActionKind.END_COMPUTE_BATCH:
+                        compute_batch_end = True
+                        return False
+                    if quota.kind == ActionKind.SKIP_CANDIDATE:
+                        policy_skipped.add(request.request_id)
+                        req_index += 1
+                        return True
+                    action_end_after_commit = quota.end_after_commit
+                    num_new_tokens = quota.compute_tokens or num_new_tokens
+                else:
+                    num_new_tokens = quota
 
             # Schedule newly needed KV blocks for the request.
             native_compute_tokens = num_new_tokens
             compute_grant = None
+            allocation_retried = False
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
+                    if action_feedback and allocation_retried:
+                        self._action_attempt(request, "compute", request.num_computed_tokens,
+                                             request.num_computed_tokens + native_compute_tokens, renew=True)
+                    allocation_retried = True
                     if compute_budget_enabled:
                         # Re-propose after a same-step rollback; its successful
                         # compute terms may have changed. Never probe allocation.
@@ -1221,7 +1488,7 @@ class Scheduler(SchedulerInterface):
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
                             restored = num_scheduled_tokens.pop(preempted_req_id)
-                            if compute_budget_enabled:
+                            if compute_budget_enabled and not action_feedback:
                                 self._compute_budget_revoke(preempted_req_id)
                             token_budget += restored
                             input_budget += restored + draft_slots
@@ -1253,6 +1520,8 @@ class Scheduler(SchedulerInterface):
                         scheduled_timestamp,
                         drop_stale_output=self.requires_kv_delivery,
                     )
+                    if action_feedback:
+                        self._action_revoke(preempted_req.request_id)
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.
@@ -1281,9 +1550,11 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
-            if compute_budget_enabled:
+            if action_feedback:
+                self._action_selected(request, request.num_computed_tokens, num_new_tokens, "running", compute_grant)
+            elif compute_budget_enabled:
                 self._compute_budget_commit(compute_grant, "running")
-                compute_batch_end = compute_grant.end_after_commit
+            compute_batch_end = action_end_after_commit or bool(compute_grant and compute_grant.end_after_commit)
             req_index += 1
 
             # Speculative decode related.
@@ -1328,11 +1599,22 @@ class Scheduler(SchedulerInterface):
             # in `running` but still hold a model-runner request slot.
             num_running = len(self.running) + self.num_waiting_for_streaming_input
             if num_running >= self.max_num_running_reqs:
-                if decoupled_control:
+                if decoupled_control or action_feedback:
                     mark(request_queue.peek_request(), "operation_max_num_seqs")
                 return False
             request = request_queue.peek_request()
             request_id = request.request_id
+            def skip_policy_candidate():
+                policy_skipped.add(request_id)
+                if not restore_only:
+                    request_queue.pop_request()
+                    entry = policy_held_queues.setdefault(id(request_queue), (request_queue, []))
+                    entry[1].append(request)
+
+            if action_feedback and (request_id in policy_skipped
+                                    or request_id in self._action_feedback.skipped_requests):
+                skip_policy_candidate()
+                return True
             def defer_waiting_request():
                 if not restore_only:
                     request_queue.pop_request()
@@ -1571,7 +1853,8 @@ class Scheduler(SchedulerInterface):
             ):
                 conditional_stop = True
                 return False
-            if decoupled_control:
+            action_end_after_commit = False
+            if decoupled_control or action_feedback:
                 decision = self._decide_operation(
                     request, "load" if load_kv_async else "compute",
                     num_new_local_computed_tokens if load_kv_async else
@@ -1583,7 +1866,18 @@ class Scheduler(SchedulerInterface):
                 )
                 if decision is None:
                     return False
-                if not load_kv_async:
+                from vllm.v1.core.sched.prefill_operations import OperationAction, ActionKind
+                if isinstance(decision, OperationAction):
+                    if decision.kind == ActionKind.END_COMPUTE_BATCH:
+                        compute_batch_end = True
+                        return False
+                    if decision.kind == ActionKind.SKIP_CANDIDATE:
+                        skip_policy_candidate()
+                        return True
+                    action_end_after_commit = decision.end_after_commit
+                    if not load_kv_async:
+                        num_new_tokens = decision.compute_tokens or num_new_tokens
+                elif not load_kv_async:
                     num_new_tokens = decision
             compute_grant = None
             if compute_budget_enabled and not load_kv_async:
@@ -1699,6 +1993,8 @@ class Scheduler(SchedulerInterface):
                             num_computed_tokens,
                         )
                     )
+                if action_feedback:
+                    self._action_load_reserved(request, num_new_local_computed_tokens, num_computed_tokens)
                 return True
             if global_order:
                 ledger.record(request, 'new' if request.status == RequestStatus.WAITING else 'resumed', num_computed_tokens, num_new_tokens)
@@ -1736,11 +2032,13 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
-            if compute_budget_enabled:
+            if compute_budget_enabled and not action_feedback:
                 self._compute_budget_commit(compute_grant, "waiting")
-                compute_batch_end = compute_grant.end_after_commit
             request.status = RequestStatus.RUNNING
             request.num_computed_tokens = num_computed_tokens
+            if action_feedback:
+                self._action_selected(request, num_computed_tokens, num_new_tokens, "waiting", compute_grant)
+            compute_batch_end = action_end_after_commit or bool(compute_grant and compute_grant.end_after_commit)
             if pad_spec_decode:
                 assert num_new_tokens == 1 + self.num_spec_tokens
                 scheduled_spec_decode_tokens[request_id] = [
@@ -1886,6 +2184,8 @@ class Scheduler(SchedulerInterface):
 
 
         # Check if the scheduling constraints are satisfied.
+        for queue, held in policy_held_queues.values():
+            queue.prepend_requests(reversed(held))
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         if compute_budget_enabled:
             self._compute_budget.assert_output(num_scheduled_tokens)
@@ -2028,6 +2328,9 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )
+        if action_feedback:
+            # Local correlation only; does not change the worker protocol.
+            scheduler_output._action_step_id = self.current_step
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -2502,6 +2805,17 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        self._check_action_entry()
+        action_step = getattr(scheduler_output, "_action_step_id", None)
+        action_results = {}
+        if action_step is not None:
+            from vllm.v1.core.sched.prefill_operations import ResultKind
+            for rid in scheduler_output.num_scheduled_tokens:
+                evidence = self._action_compute.get((action_step, rid))
+                if evidence is not None:
+                    action_results[rid] = evidence
+                    self._action_feedback.report(evidence, ResultKind.COMPLETION,
+                                                 native_phase="model_runner_output_received")
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -2680,6 +2994,9 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
+            if req_id in action_results:
+                self._action_feedback.report(action_results[req_id], ResultKind.ADOPTED,
+                                             native_phase="native_output_processed")
             if new_token_ids and self.structured_output_manager.should_advance(
                 request, new_token_ids=new_token_ids
             ):
@@ -2928,6 +3245,10 @@ class Scheduler(SchedulerInterface):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
+        for rid, evidence in action_results.items():
+            self._action_feedback.report(evidence, ResultKind.ENDED,
+                                         native_phase="native_output_processed")
+            self._action_compute.pop((action_step, rid), None)
         return engine_core_outputs
 
     @staticmethod
@@ -3095,6 +3416,7 @@ class Scheduler(SchedulerInterface):
         return self.kv_cache_manager.usage
 
     def add_request(self, request: Request) -> None:
+        self._check_action_entry()
         if getattr(self, "_prefill_operations_enabled", False) and (
             request.max_tokens != 1 or request.resumable or request.has_encoder_inputs
         ):
@@ -3152,6 +3474,7 @@ class Scheduler(SchedulerInterface):
             already finished.
         """
         assert RequestStatus.is_finished(finished_status)
+        self._check_action_entry()
         if isinstance(request_ids, str):
             request_ids = (request_ids,)
         elif request_ids is not None:
@@ -3225,6 +3548,8 @@ class Scheduler(SchedulerInterface):
             self.finished_req_ids_dict[request.client_index].add(request_id)
 
         delay_free_blocks |= connector_delay_free_blocks
+        if getattr(self, "_action_feedback", None) is not None and delay_free_blocks:
+            self._action_request_pending(request, "native_connector_or_load_obligation")
         from vllm.v1 import eviction_probe
         eviction_probe.request_hold(self, request, delay_free_blocks, connector_delay_free_blocks)
         if not delay_free_blocks:
@@ -3236,6 +3561,9 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
         self._free_request_blocks(request)
         del self.requests[request.request_id]
+        if getattr(self, "_action_feedback", None) is not None:
+            if request.request_id not in self._action_deferred_frees.values():
+                self._action_request_released(request.request_id)
 
     @property
     def pause_state(self) -> PauseState:
@@ -3260,6 +3588,9 @@ class Scheduler(SchedulerInterface):
         blocks = self.kv_cache_manager.pop_blocks_for_free(request)
         if blocks:
             self.deferred_frees.append((self.sched_step_seq, blocks))
+            if getattr(self, "_action_feedback", None) is not None and request.is_finished():
+                self._action_deferred_frees[id(blocks)] = request.request_id
+                self._action_request_pending(request, "native_gpu_fence_pending")
 
     def _free_cow_retained_blocks(
         self, blocks: list[KVCacheBlock], fence_seq: int
@@ -3287,6 +3618,10 @@ class Scheduler(SchedulerInterface):
             _, blocks = self.deferred_frees.popleft()
             # Free in reverse order so that the tail blocks are evicted first.
             self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
+            if getattr(self, "_action_feedback", None) is not None:
+                rid = self._action_deferred_frees.pop(id(blocks), None)
+                if rid is not None:
+                    self._action_request_released(rid)
 
     def get_num_unfinished_requests(self) -> int:
         if self._pause_state == PauseState.PAUSED_ALL:
@@ -3552,6 +3887,10 @@ class Scheduler(SchedulerInterface):
         assert self.connector is not None
 
         if request.request_id in self.failed_recving_kv_req_ids:
+            if getattr(self, "_action_feedback", None) is not None:
+                from vllm.v1.core.sched.prefill_operations import ResultKind
+                self._action_load_transition(request.request_id, ResultKind.FAILURE,
+                                             native_phase="native_invalid_blocks_received")
             wait_emit(
                 "load_failure_recompute",
                 request.request_id,
@@ -3607,6 +3946,10 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.PREEMPTED
             else:
                 request.status = RequestStatus.WAITING
+            if getattr(self, "_action_feedback", None) is not None:
+                from vllm.v1.core.sched.prefill_operations import ResultKind
+                self._action_load_transition(request.request_id, ResultKind.ADOPTED,
+                                             native_phase="native_kv_publication_and_status_adoption")
             return True
 
         if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
@@ -3644,6 +3987,13 @@ class Scheduler(SchedulerInterface):
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
+            if getattr(self, "_action_feedback", None) is not None:
+                duplicate, receipt_identity = self._action_duplicate_native_receipt("recv", req_id)
+                if duplicate:
+                    continue
+                from vllm.v1.core.sched.prefill_operations import ResultKind
+                self._action_load_transition(req_id, ResultKind.COMPLETION,
+                                             native_phase="native_finished_recving")
             wait_emit("scheduler_recv_notification", req_id)
             logger.debug("Finished recving KV transfer for request %s", req_id)
             assert req_id in self.requests
@@ -3653,11 +4003,20 @@ class Scheduler(SchedulerInterface):
             else:
                 assert RequestStatus.is_finished(req.status)
                 self._free_blocks(self.requests[req_id])
+            if getattr(self, "_action_feedback", None) is not None:
+                self._action_record_native_receipt("recv", req_id, receipt_identity)
         for req_id in kv_connector_output.finished_sending or ():
+            if getattr(self, "_action_feedback", None) is not None:
+                duplicate, receipt_identity = self._action_duplicate_native_receipt("send", req_id)
+                if duplicate:
+                    continue
+                self._action_stores_finished(req_id)
             wait_emit("scheduler_store_completion_observed", req_id)
             logger.debug("Finished sending KV transfer for request %s", req_id)
             assert req_id in self.requests
             self._free_blocks(self.requests[req_id])
+            if getattr(self, "_action_feedback", None) is not None:
+                self._action_record_native_receipt("send", req_id, receipt_identity)
 
     def _update_requests_with_invalid_blocks(
         self,

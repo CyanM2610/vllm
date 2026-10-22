@@ -41,17 +41,27 @@ class ComputeBudgetMixin:
         scope, errors = frozen_config_scope(
             self.vllm_config, self.block_size, expected_token_budget=hard_cap)
         config = self.vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+        action_combination = (
+            getattr(self, "_action_feedback", None) is not None
+            and mode in ("off", "fixed") and config_path is None and hard_cap == 2048
+            and not getattr(self, "_global_sjf_input_enabled", False)
+            and not getattr(self, "_conditional_end_enabled", False)
+        )
+        if getattr(self, "_action_feedback", None) is not None and not action_combination:
+            errors.append("unverified_action_feedback_combination")
         for name in (
             "decoupled_control",
             "prepare_lookup_operations",
             "decoupled_store",
         ):
             if config.get("lmcache.mp." + name, False):
-                errors.append(name)
+                if not action_combination or name == "prepare_lookup_operations":
+                    errors.append(name)
         if getattr(self, "_prefill_operations_enabled", False) or getattr(
             self, "_conditional_end_enabled", False
         ):
-            errors.append("operation_or_conditional_end_scheduler")
+            if not action_combination:
+                errors.append("operation_or_conditional_end_scheduler")
         if not self.use_v2_model_runner or self.max_num_scheduled_tokens != hard_cap:
             errors.append("V2_native_hard_budget")
         if (
