@@ -387,6 +387,284 @@ class Scheduler(SchedulerInterface):
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
+        self._init_prefill_operations()
+
+    def _init_prefill_operations(self) -> None:
+        self._decoupled_control = bool(
+            getattr(self.connector, "decoupled_control_enabled", False)
+        )
+        self._prefill_operations_enabled = self._decoupled_control or bool(
+            getattr(self.connector, "decoupled_store_enabled", False)
+        )
+        if not self._prefill_operations_enabled:
+            return
+        from collections import OrderedDict
+
+        from vllm.v1.core.sched.prefill_operations import NativeOperationDecider
+        from vllm.v1.kv_cache_interface import (
+            get_kv_cache_spec_kind,
+            iter_layer_specs,
+        )
+
+        if (
+            self.policy != SchedulingPolicy.FCFS
+            or not self.scheduler_config.async_scheduling
+            or self.scheduler_config.is_multimodal_model
+            or self.vllm_config.speculative_config is not None
+            or self.vllm_config.model_config.is_diffusion
+            or not self.vllm_config.model_config.enforce_eager
+            or not self.vllm_config.cache_config.enable_prefix_caching
+            or self.lora_config is not None
+            or self.ec_connector is not None
+            or self.is_encoder_decoder
+            or self.has_mamba_layers
+            or not self.use_v2_model_runner
+            or self.parallel_config.tensor_parallel_size != 1
+            or self.parallel_config.pipeline_parallel_size != 1
+            or self.parallel_config.data_parallel_size != 1
+            or self.parallel_config.decode_context_parallel_size != 1
+            or self.parallel_config.prefill_context_parallel_size != 1
+            or not self.scheduler_reserve_full_isl
+            or len(self.kv_cache_config.kv_cache_groups) != 1
+        ):
+            raise ValueError("decoupled control supports single-instance V2 text P-only")
+        spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
+        layer_specs = iter_layer_specs(spec)
+        if not layer_specs or any(
+            get_kv_cache_spec_kind(layer).value != "full_attention"
+            or layer.sliding_window is not None
+            or layer.attention_chunk_size is not None
+            or layer.non_causal
+            for layer in layer_specs
+        ):
+            raise ValueError("decoupled control requires one full-attention KV group")
+        self._operation_limit = self.connector.operation_step_limit
+        if type(self._operation_limit) is not int or self._operation_limit <= 0:
+            raise ValueError("operation_step_limit must be a positive integer")
+        self._operation_requests = OrderedDict()
+        self._step_operations = []
+        self._operation_candidates = ()
+        self._operation_budget = self.max_num_scheduled_tokens
+        self._operation_input_budget = self.scheduler_config.max_num_batched_tokens
+        self._operation_decider = NativeOperationDecider()
+        if self.connector.decoupled_store_enabled:
+            self.connector.set_operation_decider(self._decide_store_operation)
+
+    def _register_operation_request(self, request: Request) -> None:
+        if getattr(self, "_decoupled_control", False):
+            self._operation_requests.setdefault(request.request_id, request)
+
+    def _retire_operation_request(self, request: Request) -> None:
+        if getattr(self, "_decoupled_control", False):
+            self._operation_requests.pop(request.request_id, None)
+
+    def get_prefill_operation_step_view(self):
+        """Return observations only; no matching, allocation or ownership changes."""
+        from vllm.v1.core.sched.prefill_operations import OperationView, StepOperationView
+
+        if not getattr(self, "_prefill_operations_enabled", False):
+            raise RuntimeError("decoupled control is disabled")
+        connector_views = []
+        for operation in self.connector.get_operation_snapshot():
+            dependencies = operation.get("dependencies", ())
+            if isinstance(dependencies, dict):
+                dependencies = dependencies.items()
+            connector_views.append(OperationView(
+                operation["operation_id"], operation["request_id"],
+                operation["kind"], operation.get("start_token"),
+                operation.get("end_token"), operation["stage"],
+                tuple(dependencies), operation.get("blocked_reason",
+                                                  operation.get("block_reason")),
+                owner=operation.get("owner", "native_connector"),
+                native_phase=operation.get("native_phase"),
+                source_ownership=operation.get("source_ownership"),
+                physical_ready=operation.get("source_readable", "unknown"),
+                resources=tuple(operation.get("resources", ())),
+            ))
+        return StepOperationView(
+            self.current_step,
+            self._operation_budget,
+            self._operation_input_budget,
+            self.kv_cache_manager.block_pool.get_num_free_blocks(),
+            self._inflight_prefill_reserved_blocks(),
+            tuple(self._step_operations),
+            tuple(connector_views),
+        )
+
+    def set_prefill_operation_decider(self, decider) -> None:
+        if not getattr(self, "_prefill_operations_enabled", False):
+            raise RuntimeError("decoupled control is disabled")
+        if not callable(getattr(decider, "decide", None)):
+            raise TypeError("operation decider must provide decide(step, candidate)")
+        self._operation_decider = decider
+
+    def _decide_store_operation(self, candidate):
+        from vllm.v1.core.sched.prefill_operations import OperationDecision, OperationView
+
+        view = OperationView(
+            candidate["operation_id"], candidate["request_id"], "store",
+            candidate["start_token"], candidate["end_token"], candidate["stage"],
+            tuple(candidate.get("dependencies", ())),
+            candidate.get("blocked_reason", candidate.get("block_reason")),
+            owner=candidate.get("owner", "native_connector"),
+            native_phase=candidate.get("native_phase"),
+            source_ownership=candidate.get("source_ownership"),
+            physical_ready=candidate.get("source_readable", "unknown"),
+            resources=tuple(candidate.get("resources", ())),
+        )
+        self._step_operations.append(view)
+        decision = self._operation_decider.decide(
+            self.get_prefill_operation_step_view(), view
+        )
+        if (not isinstance(decision, OperationDecision)
+                or decision.action not in ("attempt", "defer")
+                or decision.compute_tokens is not None):
+            raise ValueError("STORE decision must be attempt/defer without quota")
+        return "submit" if decision.action == "attempt" else "defer"
+
+    def _progress_retained_store_operations(self):
+        if not self.connector.decoupled_store_enabled:
+            return
+        candidates = self.connector.get_retained_store_candidates(self._operation_limit)
+        for candidate in candidates:
+            if self._decide_store_operation(candidate) == "submit":
+                self.connector.request_store_submission([candidate["operation_id"]])
+
+    def _observe_operation(self, request, kind, stage, start=0, end=None,
+                           dependencies=(), reason=None, proposed=None, granted=None):
+        from vllm.v1.core.sched.prefill_operations import OperationView
+
+        if end is None:
+            end = request.num_prompt_tokens
+        identity = f"{request.request_id}:{kind}:{request.num_preemptions}"
+        if kind == "compute":
+            identity += f":{self.current_step}:{start}:{end}"
+        elif kind == "lookup":
+            state = self.connector.lookup_operation_state(request.request_id)
+            identity = state["operation_id"] or identity
+        view = OperationView(
+            identity,
+            request.request_id, kind, start, end, stage, tuple(dependencies),
+            reason, proposed, granted,
+            request_status=request.status.name,
+            input_tokens=request.num_prompt_tokens,
+            accounted_computed_tokens=request.num_computed_tokens,
+            in_flight_tokens=request.num_in_flight_tokens,
+        )
+        self._step_operations.append(view)
+        wait_emit(
+            "prefill_operation", request.request_id, step=self.current_step,
+            operation_id=view.operation_id, operation=kind, stage=stage,
+            start_token=start, end_token=end, dependencies=dict(dependencies),
+            reason=reason, proposed_tokens=proposed, granted_tokens=granted,
+        )
+        return view
+
+    def _decide_operation(self, request, kind, start, end, token_budget,
+                          input_budget, proposed=None):
+        from vllm.v1.core.sched.prefill_operations import OperationDecision
+
+        self._operation_budget = token_budget
+        self._operation_input_budget = input_budget
+        view = self._observe_operation(
+            request, kind, "dependencies_checked", start, end,
+            dependencies=(("scheduler_prerequisites", "confirmed"),
+                          ("capacity_acquired", "unknown"),
+                          ("physical_inputs_ready", "unknown")), proposed=proposed,
+        )
+        decision = self._operation_decider.decide(
+            self.get_prefill_operation_step_view(), view
+        )
+        if not isinstance(decision, OperationDecision):
+            raise TypeError("operation decider must return OperationDecision")
+        if decision.action not in ("attempt", "defer"):
+            raise ValueError("unknown operation decision")
+        quota = decision.compute_tokens
+        if quota is not None and (
+            kind != "compute" or type(quota) is not int
+            or not 0 < quota <= proposed
+        ):
+            raise ValueError("compute quota must be within the native proposal")
+        if decision.action == "defer":
+            self._observe_operation(request, kind, "discovered", start, end,
+                                    reason="decision_deferred")
+            return None
+        if kind != "compute":
+            return True
+        return proposed if quota is None else quota
+
+    def _begin_prefill_operation_step(self) -> None:
+        if getattr(self, "_global_sjf_input_enabled", False) or getattr(
+            self, "_conditional_end_enabled", False
+        ):
+            raise ValueError("decoupled control requires native request ordering")
+        self._step_operations = []
+        self._operation_budget = self.max_num_scheduled_tokens
+        self._operation_input_budget = self.scheduler_config.max_num_batched_tokens
+        if not self._decoupled_control:
+            return
+        self.connector.begin_prefill_control_step(self.current_step)
+        candidates = []
+        for _ in range(min(self._operation_limit, len(self._operation_requests))):
+            rid, request = self._operation_requests.popitem(last=False)
+            if self.requests.get(rid) is not request or request.is_finished():
+                continue
+            if request.status == RequestStatus.RUNNING:
+                continue
+            self._operation_requests[rid] = request
+            candidates.append(request)
+            if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                finished = rid in self.finished_recving_kv_req_ids
+                self._observe_operation(
+                    request, "load",
+                    "completed_observed" if finished else "committed_metadata",
+                    dependencies=(("worker_completion_received",
+                                   "confirmed" if finished else "pending"),),
+                )
+                if finished and self._try_promote_blocked_waiting_request(request):
+                    self._observe_operation(request, "load", "published")
+            if request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+                lookup = self.connector.lookup_operation_state(rid)
+                if request.num_computed_tokens or request.num_preemptions:
+                    kind = "compute"
+                elif lookup["result_known"]:
+                    kind = "load" if lookup["result_tokens"] > 0 else "compute"
+                else:
+                    kind = "lookup"
+                self._observe_operation(
+                    request, kind, "discovered",
+                    dependencies=(("lookup_result", "confirmed" if
+                                   lookup["result_known"] else "unknown"),
+                                  ("hbm_match", "unknown"),
+                                  ("capacity_acquired", "unknown"),
+                                  ("physical_inputs_ready", "unknown")),
+                )
+        self._operation_candidates = tuple(candidates)
+
+    def _prepare_new_lookup_operations(self) -> None:
+        if not self.connector.prepare_lookup_operations:
+            return
+        for request in sorted(self._operation_candidates,
+                              key=lambda r: r.arrival_time):
+            if (request.status != RequestStatus.WAITING
+                    or request.num_computed_tokens != 0):
+                continue
+            state = self.connector.lookup_operation_state(request.request_id)
+            if state["submitted"] or state["result_known"]:
+                continue
+            self._observe_operation(request, "lookup", "discovered")
+            decision = self._decide_operation(
+                request, "lookup", 0, request.num_prompt_tokens,
+                self._operation_budget, self._operation_input_budget,
+            )
+            if decision is None:
+                continue
+            self.connector.prepare_lookup_operation(request)
+            state = self.connector.lookup_operation_state(request.request_id)
+            self._observe_operation(
+                request, "lookup", "submitted" if state["submitted"]
+                else "discovered",
+            )
 
     def _mamba_block_aligned_split(
         self,
@@ -670,6 +948,10 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+        decoupled_control = getattr(self, "_decoupled_control", False)
+        operations_enabled = getattr(self, "_prefill_operations_enabled", False)
+        if operations_enabled:
+            self._begin_prefill_operation_step()
         conditional_end = getattr(self, "_conditional_end_enabled", False)
         conditional_stop = False
         if conditional_end:
@@ -693,6 +975,16 @@ class Scheduler(SchedulerInterface):
 
         def mark(request, reason, **fields):
             compute_mark(self, request, reason, **fields)
+            if decoupled_control and reason in (
+                "lookup_pending", "blocked_waiting_dependency",
+                "stale_output_pending", "waiting_allocation_failed",
+                "running_allocation_failed", "native_zero_quota",
+                "output_limit_guard", "operation_max_num_seqs",
+            ):
+                self._observe_operation(
+                    request, "load" if active_branch == "restore_control"
+                    else "compute", "discovered", reason=reason,
+                )
             if global_order:
                 self._global_sjf_observe_result(
                     request, outcome="native_check", branch=active_branch,
@@ -860,6 +1152,17 @@ class Scheduler(SchedulerInterface):
                 conditional_stop = True
                 return False
 
+            if decoupled_control:
+                quota = self._decide_operation(
+                    request, "compute", request.num_computed_tokens,
+                    request.num_computed_tokens + num_new_tokens,
+                    token_budget, input_budget, num_new_tokens,
+                )
+                if quota is None:
+                    req_index += 1
+                    return True
+                num_new_tokens = quota
+
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
@@ -937,6 +1240,12 @@ class Scheduler(SchedulerInterface):
             if global_order:
                 ledger.record(request, 'running', request.num_computed_tokens, num_new_tokens)
             mark(request, "running_allocated", quota=num_new_tokens)
+            if decoupled_control:
+                self._observe_operation(
+                    request, "compute", "selected", request.num_computed_tokens,
+                    request.num_computed_tokens + num_new_tokens,
+                    granted=num_new_tokens,
+                )
             if conditional_end:
                 self._conditional_selected(request, request.num_computed_tokens, num_new_tokens, "running")
             # Schedule the request.
@@ -983,17 +1292,24 @@ class Scheduler(SchedulerInterface):
                         self.ec_connector.update_state_after_alloc(request, i)
             return True
 
-        def process_waiting(request_queue):
+        def process_waiting(request_queue, restore_only=False):
             nonlocal token_budget, input_budget, encoder_compute_budget, has_sync_kv_loads, conditional_stop
-            if input_budget <= draft_slots:
+            if not restore_only and input_budget <= draft_slots:
                 return False
             # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
             # in `running` but still hold a model-runner request slot.
             num_running = len(self.running) + self.num_waiting_for_streaming_input
             if num_running >= self.max_num_running_reqs:
+                if decoupled_control:
+                    mark(request_queue.peek_request(), "operation_max_num_seqs")
                 return False
             request = request_queue.peek_request()
             request_id = request.request_id
+            def defer_waiting_request():
+                if not restore_only:
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+
             mark(request, "waiting_visited")
             # try to promote blocked statuses while traversing skipped queue.
             if self._is_blocked_waiting_status(
@@ -1005,8 +1321,7 @@ class Scheduler(SchedulerInterface):
                         "%s is still in WAITING_FOR_REMOTE_KVS state.",
                         request_id,
                     )
-                request_queue.pop_request()
-                step_skipped_waiting.prepend_request(request)
+                defer_waiting_request()
                 return True
             if (
                 request.num_stale_output_tokens > 0
@@ -1016,8 +1331,7 @@ class Scheduler(SchedulerInterface):
                 # Deliverable stale output still in flight: resuming now
                 # could resample a position that output later delivers.
                 # It drains within the pipeline depth.
-                request_queue.pop_request()
-                step_skipped_waiting.prepend_request(request)
+                defer_waiting_request()
                 return True
             # Check that adding the request still respects the max_loras
             # constraint.
@@ -1030,8 +1344,7 @@ class Scheduler(SchedulerInterface):
                 )
             ):
                 # Scheduling would exceed max_loras, skip.
-                request_queue.pop_request()
-                step_skipped_waiting.prepend_request(request)
+                defer_waiting_request()
                 return True
             num_external_computed_tokens = 0
             load_kv_async = False
@@ -1042,13 +1355,13 @@ class Scheduler(SchedulerInterface):
                 did_prefix_cache_lookup = True
                 prepared = getattr(self, "_global_sjf_match_prepare", False)
                 match = self._match_waiting_prefix(
-                    request, phase="takeover" if prepared else "native",
-                    existing_lookup_only=prepared or (conditional_end and self._conditional_existing_lookup(request)),
+                    request, phase="restore_control" if restore_only else (
+                        "takeover" if prepared else "native"),
+                    existing_lookup_only=restore_only or prepared or (conditional_end and self._conditional_existing_lookup(request)),
                 )
                 if match is None:
                     mark(request, "lookup_pending")
-                    request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
+                    defer_waiting_request()
                     return True
                 new_computed_blocks = match.blocks
                 num_new_local_computed_tokens = match.local_tokens
@@ -1068,8 +1381,7 @@ class Scheduler(SchedulerInterface):
                         request, num_computed_tokens
                     )
                 ):
-                    request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
+                    defer_waiting_request()
                     return True
                 # Track first scheduled prefill, not post-preemption repeat prefills
                 if request.prefill_stats and request.num_preemptions <= 0:
@@ -1086,6 +1398,13 @@ class Scheduler(SchedulerInterface):
                 num_new_local_computed_tokens = 0
                 num_computed_tokens = request.num_computed_tokens
             mark(request, "matched", matched=num_computed_tokens, async_load=load_kv_async, external=num_external_computed_tokens)
+            if restore_only and not load_kv_async:
+                self._observe_operation(
+                    request, "load", "dependencies_checked",
+                    num_new_local_computed_tokens, num_computed_tokens,
+                    reason="current_hbm_needs_no_restore",
+                )
+                return True
             encoder_inputs_to_schedule = None
             external_load_encoder_input = []
             new_encoder_compute_budget = encoder_compute_budget
@@ -1221,6 +1540,20 @@ class Scheduler(SchedulerInterface):
             ):
                 conditional_stop = True
                 return False
+            if decoupled_control:
+                decision = self._decide_operation(
+                    request, "load" if load_kv_async else "compute",
+                    num_new_local_computed_tokens if load_kv_async else
+                    num_computed_tokens,
+                    num_computed_tokens if load_kv_async else
+                    num_computed_tokens + num_new_tokens,
+                    token_budget, input_budget,
+                    None if load_kv_async else num_new_tokens,
+                )
+                if decision is None:
+                    return False
+                if not load_kv_async:
+                    num_new_tokens = decision
             new_blocks = self.kv_cache_manager.allocate_slots(
                 request,
                 num_new_tokens,
@@ -1277,13 +1610,15 @@ class Scheduler(SchedulerInterface):
                 self.kv_cache_manager.record_prefix_cache_stats(
                     request, num_new_local_computed_tokens
                 )
-            request = request_queue.pop_request()
+            if not restore_only:
+                request = request_queue.pop_request()
             if load_kv_async:
                 # If loading async, allocate memory and put request
                 # into the WAITING_FOR_REMOTE_KV state.
                 request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                 mark(request, 'restore_reserved', matched=num_computed_tokens)
-                step_skipped_waiting.prepend_request(request)
+                if not restore_only:
+                    step_skipped_waiting.prepend_request(request)
                 # Set num_computed_tokens even though KVs are not yet loaded.
                 # request.num_computed_tokens will not be used anywhere until
                 # the request finished the KV transfer.
@@ -1298,6 +1633,13 @@ class Scheduler(SchedulerInterface):
                 # _update_waiting_for_remote_kv will then cache
                 # only the successfully loaded tokens.
                 request.num_computed_tokens = num_computed_tokens
+                if decoupled_control:
+                    self._observe_operation(
+                        request, "load", "resources_acquired",
+                        num_new_local_computed_tokens, num_computed_tokens,
+                        dependencies=(("hbm_target_reserved", "confirmed"),
+                                      ("physical_completion", "pending")),
+                    )
                 if global_order:
                     ledger.record(request, 'async_load', num_computed_tokens, 0)
                 self._inflight_prefills.add(request)
@@ -1315,6 +1657,7 @@ class Scheduler(SchedulerInterface):
             if global_order:
                 ledger.record(request, 'new' if request.status == RequestStatus.WAITING else 'resumed', num_computed_tokens, num_new_tokens)
             self.running.append(request)
+            self._retire_operation_request(request)
             if num_external_computed_tokens > 0:
                 # load_kv_async is False here
                 has_sync_kv_loads = True
@@ -1336,6 +1679,12 @@ class Scheduler(SchedulerInterface):
                 request_id
             )
             mark(request, "waiting_allocated", quota=num_new_tokens, matched=num_computed_tokens)
+            if decoupled_control:
+                self._observe_operation(
+                    request, "compute", "selected", num_computed_tokens,
+                    num_computed_tokens + num_new_tokens,
+                    granted=num_new_tokens,
+                )
             if conditional_end:
                 self._conditional_selected(request, num_computed_tokens, num_new_tokens, "waiting")
             num_scheduled_tokens[request_id] = num_new_tokens
@@ -1381,6 +1730,36 @@ class Scheduler(SchedulerInterface):
                     if req.lora_request and req.lora_request.lora_int_id > 0
                 )
                 assert len(scheduled_loras) <= self.lora_config.max_loras
+
+            if (decoupled_control and not preempted_reqs
+                    and self._pause_state == PauseState.UNPAUSED):
+                self._operation_budget = token_budget
+                self._operation_input_budget = input_budget
+                self._prepare_new_lookup_operations()
+
+                class RestoreCandidateReference:
+                    def __init__(self, request):
+                        self.request = request
+
+                    def peek_request(self):
+                        return self.request
+
+                active_branch = "restore_control"
+                for request in self._operation_candidates:
+                    if (request.status not in (
+                        RequestStatus.WAITING, RequestStatus.PREEMPTED
+                    ) or request.num_computed_tokens != 0):
+                        continue
+                    lookup = self.connector.lookup_operation_state(request.request_id)
+                    self._observe_operation(
+                        request, "load", "discovered",
+                        dependencies=(("lookup_result", "confirmed" if
+                                       lookup["result_known"] else "unknown"),),
+                    )
+                    if (lookup["result_known"]
+                            and lookup["result_tokens"] > 0):
+                        process_waiting(RestoreCandidateReference(request),
+                                        restore_only=True)
 
             if not conditional_stop and not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
                 active_branch = "waiting"
@@ -1591,8 +1970,15 @@ class Scheduler(SchedulerInterface):
         # 2. Wrap up all the KV cache load / save ops into an opaque object
         # 3. Clear the internal states of the connector
         if self.connector is not None:
+            if operations_enabled:
+                self._operation_budget = token_budget
+                self._operation_input_budget = input_budget
+                self._progress_retained_store_operations()
             meta = self._build_kv_connector_meta(self.connector, scheduler_output)
             scheduler_output.kv_connector_metadata = meta
+        if decoupled_control:
+            self._operation_budget = token_budget
+            self._operation_input_budget = input_budget
 
         # Build the connector meta for ECConnector
         if self.ec_connector is not None:
@@ -1688,6 +2074,7 @@ class Scheduler(SchedulerInterface):
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
+        self._register_operation_request(request)
         self.reset_preempted_req_ids.add(request.request_id)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
@@ -2492,6 +2879,7 @@ class Scheduler(SchedulerInterface):
             self.skipped_waiting.add_request(request)
         else:
             self.waiting.add_request(request)
+        self._register_operation_request(request)
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:
@@ -2643,6 +3031,10 @@ class Scheduler(SchedulerInterface):
         return self.kv_cache_manager.usage
 
     def add_request(self, request: Request) -> None:
+        if getattr(self, "_prefill_operations_enabled", False) and (
+            request.max_tokens != 1 or request.resumable or request.has_encoder_inputs
+        ):
+            raise ValueError("decoupled control accepts text P-only max_tokens=1")
         wait_emit(
             "input_known",
             request.request_id,
@@ -2749,6 +3141,7 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
 
+        self._retire_operation_request(request)
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 

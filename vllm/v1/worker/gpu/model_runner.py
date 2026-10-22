@@ -1093,6 +1093,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
+        self.kv_connector.prepare_kv_cache_writes(scheduler_output)
         if scheduler_output.new_block_ids_to_zero:
             assert self.kv_block_zeroer is not None
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)

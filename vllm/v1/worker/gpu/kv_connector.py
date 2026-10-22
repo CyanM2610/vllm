@@ -33,6 +33,10 @@ class KVConnector:
     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
         pass
 
+    def prepare_kv_cache_writes(self, scheduler_output: "SchedulerOutput") -> None:
+        """Allow connector-owned sources to finish before native zero/CoW writes."""
+        pass
+
     def post_forward(
         self, finished_req_ids: set[str], wait_for_save: bool = True
     ) -> KVConnectorOutput | None:
@@ -57,6 +61,14 @@ class ActiveKVConnector(KVConnector):
 
         self._pending_load_start = False
         self._disabled = False
+
+    def prepare_kv_cache_writes(self, scheduler_output: "SchedulerOutput") -> None:
+        """Run an optional source-protection hook before physical cache writes."""
+        if self._disabled:
+            return
+        prepare = getattr(self.kv_connector, "prepare_kv_cache_writes", None)
+        if prepare is not None:
+            prepare(scheduler_output)
 
     @observed_host_call("kv_pre_forward")
     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
