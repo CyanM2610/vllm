@@ -7,6 +7,7 @@ The synchronous observer cost is recorded, never subtracted from latency.
 """
 
 import atexit
+from vllm.v1 import host_diagnostic as _hd
 import json
 import os
 import threading
@@ -27,8 +28,10 @@ def emit(name: str, request_id: str | None = None, **fields) -> None:
     if not _ROOT:
         return
     global _FD, _PID, _COUNT, _COST
+    _d0 = _hd.mark()
     begin = time.monotonic_ns()
     with _LOCK:
+        _d1 = _hd.mark()
         pid = os.getpid()
         if _FD is None or _PID != pid:
             os.makedirs(_ROOT, exist_ok=True)
@@ -40,11 +43,17 @@ def emit(name: str, request_id: str | None = None, **fields) -> None:
             _PID = pid
         row = dict(event=name, ts_ns=begin, pid=pid,
                    tid=threading.get_native_id(), request_id=request_id, **fields)
+        _d2 = _hd.mark()
         data = (json.dumps(row, separators=(",", ":"), default=str) + "\n").encode()
+        _d3 = _hd.mark()
         if os.write(_FD, data) != len(data):
             raise OSError("incomplete KV wait trace write")
+        _d4 = _hd.mark()
         _COUNT += 1
         _COST += time.monotonic_ns() - begin
+    _hd.record('emit.lock', _d0, _d1)
+    _hd.record('emit.serialize', _d2, _d3)
+    _hd.record('emit.write', _d3, _d4)
 
 
 def once(name: str, request_id: str, **fields) -> None:
@@ -89,6 +98,7 @@ def close() -> None:
     global _FD
     if _FD is not None and _PID == os.getpid():
         emit("observer_summary", events=_COUNT, synchronous_cost_ns=_COST)
+        _hd.dump()
         os.close(_FD)
         _FD = None
 
