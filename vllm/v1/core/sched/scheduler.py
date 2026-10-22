@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -42,6 +43,7 @@ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.retirement_observation import notify_retirement, retirement_call
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+from vllm.v1.core.sched.prepared_prefix_match import PrefixMatch
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
@@ -467,6 +469,128 @@ class Scheduler(SchedulerInterface):
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
+
+    def _timed_local_prefix_cache_hit(self, request, phase, reconcile=False):
+        started = time.monotonic_ns()
+        result = (
+            self.kv_cache_manager.get_computed_blocks(request) if reconcile
+            else self._get_local_prefix_cache_hit(request)
+        )
+        elapsed = time.monotonic_ns() - started
+        wait_emit(
+            "prefill_local_prefix_match", request.request_id,
+            phase=phase, elapsed_ns=elapsed, local_tokens=result[1],
+            call_kind="divergent_reconciliation" if reconcile else "prefix",
+            batch_id=f"{os.getpid()}:{self.current_step}",
+            input_tokens=request.num_prompt_tokens,
+            semantics="native local match call including its pre-existing nested observation costs; this timing event emission excluded; not uninstrumented pure lookup time",
+        )
+        return result
+
+    def _match_waiting_prefix(self, request, phase="native", existing_lookup_only=False):
+        # Extracted from the frozen WAITING path. Blocks are ephemeral and are
+        # adopted only by allocate_slots in the same synchronous admission.
+        num_external_computed_tokens = 0
+        load_kv_async = False
+        connector_prefix_cache_queries = 0
+        (
+            new_computed_blocks,
+            num_new_local_computed_tokens,
+            shared_prefix_boundary,
+            hit_diverged,
+        ) = self._timed_local_prefix_cache_hit(request, phase)
+        if phase == "native":
+            request.shared_prefix_boundary = shared_prefix_boundary
+        wait_emit(
+            "hbm_match",
+            request.request_id,
+            hit_tokens=num_new_local_computed_tokens, phase=phase,
+        )
+        # Get externally-cached tokens if using a KVConnector.
+        if self.connector is not None:
+            # Present a block-aligned local hit to the connector so
+            # a strictly longer remote hit can supersede a local
+            # sub-block tail without racing its copy-on-write.
+            partial_tail = num_new_local_computed_tokens % self.block_size
+            block_aligned_local = (
+                num_new_local_computed_tokens - partial_tail
+            )
+            method = self.connector.get_num_new_matched_tokens
+            if phase == "prepare":
+                method = self.connector.observe_num_new_matched_tokens
+            elif existing_lookup_only:
+                method = self.connector.get_num_new_matched_tokens_from_existing_lookup
+            lookup_started = time.monotonic_ns()
+            ext_tokens, load_kv_async = method(request, block_aligned_local)
+            lookup_elapsed = time.monotonic_ns() - lookup_started
+            counters = getattr(self, "_prefix_match_attempt_counts", None)
+            if counters is None:
+                counters = self._prefix_match_attempt_counts = {}
+            counter_key = (request.request_id, phase)
+            counters[counter_key] = counters.get(counter_key, 0) + 1
+            wait_emit(
+                "prefill_lower_match_attempt", request.request_id,
+                phase=phase, elapsed_ns=lookup_elapsed,
+                batch_id=f"{os.getpid()}:{self.current_step}",
+                existing_lookup_only=existing_lookup_only,
+                attempt_number=counters[counter_key],
+                external_tokens=ext_tokens, async_load=load_kv_async,
+                semantics="connector call/result observation; not necessarily a new remote LOOKUP",
+            )
+            wait_emit(
+                "lower_match_poll",
+                request.request_id,
+                external_tokens=ext_tokens, phase=phase,
+                async_load=load_kv_async,
+            )
+            if ext_tokens is None:
+                return None
+            if partial_tail and ext_tokens > partial_tail:
+                # Remote strictly exceeds the full local hit: drop the
+                # sub-block tail so no CoW is needed, and let the load
+                # cover it. Trim the partial block out of the local
+                # computed blocks so it is not adopted from the cache.
+                new_computed_blocks = (
+                    self.kv_cache_manager.truncate_computed_blocks(
+                        new_computed_blocks, block_aligned_local
+                    )
+                )
+                num_new_local_computed_tokens = block_aligned_local
+                num_external_computed_tokens = ext_tokens
+            elif partial_tail:
+                # Remote does not exceed the full local hit: keep the
+                # local sub-block tail and load nothing external.
+                num_external_computed_tokens = 0
+                # Nothing to load remotely -> not an async-load step;
+                # clearing avoids the `load_kv_async` assert below.
+                load_kv_async = False
+            else:
+                num_external_computed_tokens = ext_tokens
+            if hit_diverged and num_external_computed_tokens == 0:
+                # No external tokens back the deeper local hit, so its
+                # resume boundary would have no valid Mamba state.
+                # Reconcile to the boundary every group agrees on.
+                (
+                    new_computed_blocks,
+                    num_new_local_computed_tokens,
+                    shared_prefix_boundary,
+                ) = self._timed_local_prefix_cache_hit(request, phase, reconcile=True)
+                if phase == "native":
+                    request.shared_prefix_boundary = shared_prefix_boundary
+            connector_prefix_cache_queries = (
+                request.num_tokens - num_new_local_computed_tokens
+            )
+            connector_prefix_cache_hits = num_external_computed_tokens
+        # Total computed tokens (local + external).
+        num_computed_tokens = (
+            num_new_local_computed_tokens + num_external_computed_tokens
+        )
+        assert num_computed_tokens <= request.num_tokens
+        return PrefixMatch(
+            new_computed_blocks, num_new_local_computed_tokens,
+            num_external_computed_tokens, num_computed_tokens, load_kv_async,
+            shared_prefix_boundary, connector_prefix_cache_queries,
+        )
 
     def _get_local_prefix_cache_hit(
         self, request: Request
@@ -903,84 +1027,26 @@ class Scheduler(SchedulerInterface):
             # Get already-cached tokens.
             if request.num_computed_tokens == 0:
                 did_prefix_cache_lookup = True
-                (
-                    new_computed_blocks,
-                    num_new_local_computed_tokens,
-                    request.shared_prefix_boundary,
-                    hit_diverged,
-                ) = self._get_local_prefix_cache_hit(request)
-                wait_emit(
-                    "hbm_match",
-                    request.request_id,
-                    hit_tokens=num_new_local_computed_tokens,
+                prepared = getattr(self, "_global_sjf_match_prepare", False)
+                match = self._match_waiting_prefix(
+                    request, phase="takeover" if prepared else "native",
+                    existing_lookup_only=prepared,
                 )
-                # Get externally-cached tokens if using a KVConnector.
-                if self.connector is not None:
-                    # Present a block-aligned local hit to the connector so
-                    # a strictly longer remote hit can supersede a local
-                    # sub-block tail without racing its copy-on-write.
-                    partial_tail = num_new_local_computed_tokens % self.block_size
-                    block_aligned_local = (
-                        num_new_local_computed_tokens - partial_tail
-                    )
-                    ext_tokens, load_kv_async = (
-                        self.connector.get_num_new_matched_tokens(
-                            request, block_aligned_local
-                        )
-                    )
-                    wait_emit(
-                        "lower_match_poll",
-                        request.request_id,
-                        external_tokens=ext_tokens,
-                        async_load=load_kv_async,
-                    )
-                    if ext_tokens is None:
-                        mark(request, "lookup_pending")
-                        # The request cannot be scheduled because
-                        # the KVConnector couldn't determine
-                        # the number of matched tokens.
-                        request_queue.pop_request()
-                        step_skipped_waiting.prepend_request(request)
-                        return True
-                    if partial_tail and ext_tokens > partial_tail:
-                        # Remote strictly exceeds the full local hit: drop the
-                        # sub-block tail so no CoW is needed, and let the load
-                        # cover it. Trim the partial block out of the local
-                        # computed blocks so it is not adopted from the cache.
-                        new_computed_blocks = (
-                            self.kv_cache_manager.truncate_computed_blocks(
-                                new_computed_blocks, block_aligned_local
-                            )
-                        )
-                        num_new_local_computed_tokens = block_aligned_local
-                        num_external_computed_tokens = ext_tokens
-                    elif partial_tail:
-                        # Remote does not exceed the full local hit: keep the
-                        # local sub-block tail and load nothing external.
-                        num_external_computed_tokens = 0
-                        # Nothing to load remotely -> not an async-load step;
-                        # clearing avoids the `load_kv_async` assert below.
-                        load_kv_async = False
-                    else:
-                        num_external_computed_tokens = ext_tokens
-                    if hit_diverged and num_external_computed_tokens == 0:
-                        # No external tokens back the deeper local hit, so its
-                        # resume boundary would have no valid Mamba state.
-                        # Reconcile to the boundary every group agrees on.
-                        (
-                            new_computed_blocks,
-                            num_new_local_computed_tokens,
-                            request.shared_prefix_boundary,
-                        ) = self.kv_cache_manager.get_computed_blocks(request)
-                    connector_prefix_cache_queries = (
-                        request.num_tokens - num_new_local_computed_tokens
-                    )
-                    connector_prefix_cache_hits = num_external_computed_tokens
-                # Total computed tokens (local + external).
-                num_computed_tokens = (
-                    num_new_local_computed_tokens + num_external_computed_tokens
-                )
-                assert num_computed_tokens <= request.num_tokens
+                if match is None:
+                    mark(request, "lookup_pending")
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    return True
+                new_computed_blocks = match.blocks
+                num_new_local_computed_tokens = match.local_tokens
+                num_external_computed_tokens = match.external_tokens
+                num_computed_tokens = match.matched_tokens
+                load_kv_async = match.load_kv_async
+                request.shared_prefix_boundary = match.shared_prefix_boundary
+                connector_prefix_cache_queries = match.connector_queries
+                connector_prefix_cache_hits = match.external_tokens
+                if prepared:
+                    self._observe_takeover_match(request, match)
                 # Skip request with pending mm encoding prefetches
                 if (
                     self.ec_connector is not None

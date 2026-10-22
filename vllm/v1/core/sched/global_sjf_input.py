@@ -169,6 +169,11 @@ class GlobalSJFInputScheduler(AsyncScheduler):
 
     _global_sjf_input_enabled = True
 
+    def _emit_policy(self, suffix, *args, **fields):
+        if suffix == "enqueue_key_frozen":
+            suffix = "key_frozen"
+        emit("global_sjf_input_" + suffix, *args, **fields)
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._global_sjf_keys = {}
@@ -212,8 +217,8 @@ class GlobalSJFInputScheduler(AsyncScheduler):
             errors.append("connector")
         if errors:
             self._global_sjf_reject("config", errors=errors, scope=snapshot)
-        emit(
-            "global_sjf_input_enabled",
+        self._emit_policy(
+            'enabled',
             scope=snapshot,
             key_definition=[
                 "original_num_prompt_tokens",
@@ -224,8 +229,8 @@ class GlobalSJFInputScheduler(AsyncScheduler):
         )
 
     def _global_sjf_reject(self, reason, request=None, **fields):
-        emit(
-            "global_sjf_input_scope_rejected",
+        self._emit_policy(
+            'scope_rejected',
             getattr(request, "request_id", None),
             reason=reason,
             **fields,
@@ -282,8 +287,8 @@ class GlobalSJFInputScheduler(AsyncScheduler):
         self._global_sjf_requests[rid] = request
         self._global_sjf_seen_ids.add(rid)
         super().add_request(request)
-        emit(
-            "global_sjf_input_key_frozen",
+        self._emit_policy(
+            'enqueue_key_frozen',
             rid,
             prompt_tokens=key.prompt_tokens,
             arrival_time=key.arrival_time,
@@ -356,8 +361,8 @@ class GlobalSJFInputScheduler(AsyncScheduler):
                 }
             )
         elapsed = time.monotonic_ns() - started
-        emit(
-            "global_sjf_input_candidates",
+        self._emit_policy(
+            'candidates',
             batch_id=self._global_sjf_batch_id(),
             step=self.current_step,
             native_bucket_view=native_view,
@@ -372,8 +377,8 @@ class GlobalSJFInputScheduler(AsyncScheduler):
         self, request, *, outcome, branch, reason=None, quota=0, **fields
     ):
         self._global_sjf_result_count += 1
-        emit(
-            "global_sjf_input_result",
+        self._emit_policy(
+            'result',
             request.request_id,
             batch_id=self._global_sjf_batch_id(),
             step=self.current_step,
@@ -404,8 +409,8 @@ class GlobalSJFInputScheduler(AsyncScheduler):
         self._global_sjf_worker_initialized.difference_update(finished)
         self._global_sjf_retire_observer_references()
         quotas = dict(output.num_scheduled_tokens)
-        emit(
-            "global_sjf_input_step_end",
+        self._emit_policy(
+            'step_end',
             batch_id=self._global_sjf_batch_id(),
             step=self.current_step,
             ordered_candidates=self._global_sjf_ordered_ids,
