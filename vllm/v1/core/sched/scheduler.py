@@ -956,6 +956,10 @@ class Scheduler(SchedulerInterface):
         conditional_stop = False
         if conditional_end:
             self._conditional_begin()
+        compute_budget_enabled = getattr(self, "_compute_budget", None) is not None
+        compute_batch_end = False
+        if compute_budget_enabled:
+            self._compute_budget_begin()
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
@@ -1003,6 +1007,8 @@ class Scheduler(SchedulerInterface):
                 rid = request.request_id
                 bucket = rollback_buckets.get(rid, 'running')
                 restored = num_scheduled_tokens.pop(rid, 0)
+                if compute_budget_enabled:
+                    self._compute_budget_revoke(rid)
                 token_budget += restored
                 if restored:
                     input_budget += restored + draft_slots
@@ -1038,7 +1044,7 @@ class Scheduler(SchedulerInterface):
                 )
 
         def process_running(request):
-            nonlocal req_index, token_budget, input_budget, encoder_compute_budget, prefill_scheduled, conditional_stop
+            nonlocal req_index, token_budget, input_budget, encoder_compute_budget, prefill_scheduled, conditional_stop, compute_batch_end
             mark(request, "running_visited")
             if input_budget <= draft_slots:
                 return False
@@ -1164,8 +1170,21 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = quota
 
             # Schedule newly needed KV blocks for the request.
+            native_compute_tokens = num_new_tokens
+            compute_grant = None
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
+                    if compute_budget_enabled:
+                        # Re-propose after a same-step rollback; its successful
+                        # compute terms may have changed. Never probe allocation.
+                        compute_grant = self._compute_budget_propose(
+                            request, request.num_computed_tokens,
+                            native_compute_tokens, "running",
+                        )
+                        if compute_grant.tokens == 0:
+                            compute_batch_end = True
+                            return False
+                        num_new_tokens = compute_grant.tokens
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
@@ -1198,6 +1217,8 @@ class Scheduler(SchedulerInterface):
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
                             restored = num_scheduled_tokens.pop(preempted_req_id)
+                            if compute_budget_enabled:
+                                self._compute_budget_revoke(preempted_req_id)
                             token_budget += restored
                             input_budget += restored + draft_slots
                             req_to_new_blocks.pop(preempted_req_id)
@@ -1256,6 +1277,9 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
+            if compute_budget_enabled:
+                self._compute_budget_commit(compute_grant, "running")
+                compute_batch_end = compute_grant.end_after_commit
             req_index += 1
 
             # Speculative decode related.
@@ -1290,10 +1314,10 @@ class Scheduler(SchedulerInterface):
                     self.encoder_cache_manager.allocate(request, i)
                     if self.ec_connector is not None:
                         self.ec_connector.update_state_after_alloc(request, i)
-            return True
+            return not compute_batch_end
 
         def process_waiting(request_queue, restore_only=False):
-            nonlocal token_budget, input_budget, encoder_compute_budget, has_sync_kv_loads, conditional_stop
+            nonlocal token_budget, input_budget, encoder_compute_budget, has_sync_kv_loads, conditional_stop, compute_batch_end
             if not restore_only and input_budget <= draft_slots:
                 return False
             # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
@@ -1357,7 +1381,10 @@ class Scheduler(SchedulerInterface):
                 match = self._match_waiting_prefix(
                     request, phase="restore_control" if restore_only else (
                         "takeover" if prepared else "native"),
-                    existing_lookup_only=restore_only or prepared or (conditional_end and self._conditional_existing_lookup(request)),
+                    existing_lookup_only=restore_only or prepared or (conditional_end and self._conditional_existing_lookup(request)) or (
+                        compute_budget_enabled
+                        and request.request_id in self._compute_budget_retry_matches
+                    ),
                 )
                 if match is None:
                     mark(request, "lookup_pending")
@@ -1554,6 +1581,16 @@ class Scheduler(SchedulerInterface):
                     return False
                 if not load_kv_async:
                     num_new_tokens = decision
+            compute_grant = None
+            if compute_budget_enabled and not load_kv_async:
+                compute_grant = self._compute_budget_propose(
+                    request, num_computed_tokens, num_new_tokens, "waiting"
+                )
+                if compute_grant.tokens == 0:
+                    self._compute_budget_retry_matches.add(request_id)
+                    compute_batch_end = True
+                    return False
+                num_new_tokens = compute_grant.tokens
             new_blocks = self.kv_cache_manager.allocate_slots(
                 request,
                 num_new_tokens,
@@ -1569,6 +1606,9 @@ class Scheduler(SchedulerInterface):
             )
             if new_blocks is None:
                 mark(request, 'waiting_allocation_failed')
+                if (compute_budget_enabled and not load_kv_async
+                        and self._compute_budget.mode != "off"):
+                    self._compute_budget_retry_matches.add(request_id)
                 # The request cannot be scheduled.
                 # NOTE: we need to untouch the request from the encode cache
                 # manager
@@ -1613,6 +1653,8 @@ class Scheduler(SchedulerInterface):
             if not restore_only:
                 request = request_queue.pop_request()
             if load_kv_async:
+                if compute_budget_enabled:
+                    self._compute_budget_retry_matches.discard(request_id)
                 # If loading async, allocate memory and put request
                 # into the WAITING_FOR_REMOTE_KV state.
                 request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
@@ -1690,6 +1732,9 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
+            if compute_budget_enabled:
+                self._compute_budget_commit(compute_grant, "waiting")
+                compute_batch_end = compute_grant.end_after_commit
             request.status = RequestStatus.RUNNING
             request.num_computed_tokens = num_computed_tokens
             if pad_spec_decode:
@@ -1715,7 +1760,7 @@ class Scheduler(SchedulerInterface):
                     self.encoder_cache_manager.allocate(request, i)
                     if self.ec_connector is not None:
                         self.ec_connector.update_state_after_alloc(request, i)
-            return True
+            return not compute_batch_end
 
         if not global_order:
             active_branch = "running"
@@ -1761,7 +1806,7 @@ class Scheduler(SchedulerInterface):
                         process_waiting(RestoreCandidateReference(request),
                                         restore_only=True)
 
-            if not conditional_stop and not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+            if not conditional_stop and not compute_batch_end and not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
                 active_branch = "waiting"
                 while (self.waiting or self.skipped_waiting) and token_budget > 0:
                     queue = self._select_waiting_queue_for_scheduling()
@@ -1789,7 +1834,7 @@ class Scheduler(SchedulerInterface):
             visited = set()
             waiting_closed = self._pause_state != PauseState.UNPAUSED
             for request in self._global_sjf_candidates():
-                if token_budget <= 0 or input_budget <= draft_slots:
+                if compute_batch_end or token_budget <= 0 or input_budget <= draft_slots:
                     break
                 if id(request) in visited:
                     raise AssertionError("candidate visited twice")
@@ -1825,6 +1870,8 @@ class Scheduler(SchedulerInterface):
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+        if compute_budget_enabled:
+            self._compute_budget.assert_output(num_scheduled_tokens)
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
 
         assert token_budget >= 0

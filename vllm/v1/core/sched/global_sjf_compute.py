@@ -177,10 +177,13 @@ class GlobalSJFInputPreparedScheduler(GlobalSJFInputScheduler):
         self._global_sjf_result_count = 0
         self._prepare_first_matches(requests)
         started = time.monotonic_ns()
+        thread_started = time.thread_time_ns()
         known = [r for r in requests if r.request_id in self._prepared_keys]
         sort_started = time.monotonic_ns()
+        sort_thread_started = time.thread_time_ns()
         known.sort(key=self._prepared_sort_key)
         sort_elapsed = time.monotonic_ns() - sort_started
+        sort_thread_elapsed = time.thread_time_ns() - sort_thread_started
         self._global_sjf_ordered_ids = [r.request_id for r in known]
         rows = []
         for request in known:
@@ -202,7 +205,9 @@ class GlobalSJFInputPreparedScheduler(GlobalSJFInputScheduler):
             unknown_cost_request_ids=[r.request_id for r in requests if r.request_id not in self._prepared_keys],
             ordered_candidates=self._global_sjf_ordered_ids, candidates=rows,
             elapsed_ns=time.monotonic_ns() - started,
+            thread_cpu_ns=time.thread_time_ns() - thread_started,
             sort_elapsed_ns=sort_elapsed,
+            sort_thread_cpu_ns=sort_thread_elapsed,
             elapsed_scope="known-candidate sort and event construction; preparation and emission excluded",
         )
         return known
