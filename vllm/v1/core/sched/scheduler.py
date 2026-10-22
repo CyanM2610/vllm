@@ -670,6 +670,9 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+        batch_slice = getattr(self, "_batch_slice_enabled", False)
+        if batch_slice:
+            self._batch_slice_begin()
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
@@ -744,6 +747,10 @@ class Scheduler(SchedulerInterface):
         def process_running(request):
             nonlocal req_index, token_budget, input_budget, encoder_compute_budget, prefill_scheduled
             mark(request, "running_visited")
+            if batch_slice and self._batch_slice_defer_running(request):
+                mark(request, "batch_slice_hold")
+                req_index += 1
+                return True
             if input_budget <= draft_slots:
                 return False
 
@@ -927,7 +934,11 @@ class Scheduler(SchedulerInterface):
                 ledger.record(request, 'running', request.num_computed_tokens, num_new_tokens)
             mark(request, "running_allocated", quota=num_new_tokens)
             # Schedule the request.
-            scheduled_running_reqs.append(request)
+            if batch_slice and self._batch_slice_first_submit(request):
+                scheduled_new_reqs.append(request)
+                new_blocks = self.kv_cache_manager.get_blocks(request.request_id)
+            else:
+                scheduled_running_reqs.append(request)
             prefill_scheduled |= request.is_prefill_chunk
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
@@ -981,6 +992,11 @@ class Scheduler(SchedulerInterface):
                 return False
             request = request_queue.peek_request()
             request_id = request.request_id
+            if batch_slice and self._batch_slice_defer_waiting(request):
+                request_queue.pop_request()
+                step_skipped_waiting.prepend_request(request)
+                mark(request, "batch_slice_common_preparation")
+                return True
             mark(request, "waiting_visited")
             # try to promote blocked statuses while traversing skipped queue.
             if self._is_blocked_waiting_status(
@@ -1028,10 +1044,13 @@ class Scheduler(SchedulerInterface):
             if request.num_computed_tokens == 0:
                 did_prefix_cache_lookup = True
                 prepared = getattr(self, "_global_sjf_match_prepare", False)
-                match = self._match_waiting_prefix(
-                    request, phase="takeover" if prepared else "native",
-                    existing_lookup_only=prepared,
-                )
+                if batch_slice and self._batch_slice_is_target(request):
+                    match = self._batch_slice_take_match(request)
+                else:
+                    match = self._match_waiting_prefix(
+                        request, phase="takeover" if prepared else "native",
+                        existing_lookup_only=prepared,
+                    )
                 if match is None:
                     mark(request, "lookup_pending")
                     request_queue.pop_request()
@@ -1253,6 +1272,9 @@ class Scheduler(SchedulerInterface):
                     request, num_new_local_computed_tokens
                 )
             request = request_queue.pop_request()
+            if batch_slice and self._batch_slice_is_target(request):
+                self._batch_slice_hold(request, num_computed_tokens, num_new_tokens)
+                return True
             if load_kv_async:
                 # If loading async, allocate memory and put request
                 # into the WAITING_FOR_REMOTE_KV state.
@@ -1416,6 +1438,9 @@ class Scheduler(SchedulerInterface):
             if self._pause_state == PauseState.UNPAUSED and not defer_prefills:
                 self.prefill_capacity_bound = bool(self.waiting)
 
+
+        if batch_slice:
+            self._batch_slice_end(num_scheduled_tokens, preempted_reqs)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
