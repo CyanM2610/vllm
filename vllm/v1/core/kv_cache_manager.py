@@ -26,6 +26,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_sliding_window,
 )
 from vllm.v1.metrics.stats import PrefixCacheStats
+from vllm.v1.kv_wait_trace import emit as wait_emit
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
@@ -486,6 +487,10 @@ class KVCacheManager:
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():
+                wait_emit("capacity_denied", request.request_id,
+                          reason="full_sequence", required=required_blocks,
+                          free=self.block_pool.get_num_free_blocks(),
+                          reserved=reserved_blocks, watermark=watermark_blocks)
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -524,6 +529,10 @@ class KVCacheManager:
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
         required_blocks = num_blocks_to_allocate + watermark_blocks
         if required_blocks > available_blocks:
+            wait_emit("capacity_denied", request.request_id,
+                      reason="allocation_or_inflight_reservation",
+                      required=required_blocks, free=self.block_pool.get_num_free_blocks(),
+                      reserved=reserved_blocks, watermark=watermark_blocks)
             # Cannot allocate new blocks
             return None
 

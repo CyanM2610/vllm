@@ -35,6 +35,7 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
 )
+from vllm.v1.kv_wait_trace import emit as wait_emit, once as wait_once
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -846,6 +847,8 @@ class Scheduler(SchedulerInterface):
                         hit_diverged,
                     ) = self._get_local_prefix_cache_hit(request)
 
+                    wait_emit("hbm_match", request.request_id,
+                              hit_tokens=num_new_local_computed_tokens)
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
                         # Present a block-aligned local hit to the connector so
@@ -861,6 +864,8 @@ class Scheduler(SchedulerInterface):
                             )
                         )
 
+                        wait_emit("lower_match_poll", request.request_id,
+                                  external_tokens=ext_tokens, async_load=load_kv_async)
                         if ext_tokens is None:
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
@@ -1099,6 +1104,10 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.free(request)
                     break
 
+                wait_emit("target_reserved", request.request_id,
+                          external_tokens=num_external_computed_tokens,
+                          async_load=load_kv_async,
+                          block_ids=self.kv_cache_manager.get_blocks(request_id).get_block_ids())
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
                 # This information is used to determine if a load is
@@ -1383,6 +1392,11 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        wait_emit("schedule_output", tokens=dict(num_scheduled_tokens),
+                  waiting=len(self.waiting), running=len(self.running),
+                  free_blocks=self.kv_cache_manager.block_pool.get_num_free_blocks())
+        for wait_rid, wait_tokens in num_scheduled_tokens.items():
+            wait_once("first_schedule", wait_rid, tokens=wait_tokens)
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1962,6 +1976,8 @@ class Scheduler(SchedulerInterface):
             prefill_stats = None
             status_before_stop = request.status
             num_output_tokens_before = len(request._output_token_ids)
+            if new_token_ids and num_output_tokens_before == 0:
+                wait_once("first_token_core", request.request_id)
 
             # Check for stop and update request status.
             if new_token_ids:
@@ -2398,6 +2414,10 @@ class Scheduler(SchedulerInterface):
         return self.kv_cache_manager.usage
 
     def add_request(self, request: Request) -> None:
+        wait_emit("input_known", request.request_id,
+                  prompt_tokens=request.num_prompt_tokens,
+                  logical_id=(request.sampling_params.extra_args or {}).get("native_token_replay_id") if request.sampling_params else None,
+                  block_hashes=[str(h) for h in request.block_hashes])
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
@@ -2867,6 +2887,7 @@ class Scheduler(SchedulerInterface):
             if request.num_computed_tokens == request.num_tokens:
                 request.num_computed_tokens = request.num_tokens - 1
 
+        wait_emit("kv_published", request.request_id, tokens=request.num_computed_tokens)
         self.finished_recving_kv_req_ids.remove(request.request_id)
 
     def _try_promote_blocked_waiting_request(self, request: Request) -> bool:
@@ -2921,6 +2942,7 @@ class Scheduler(SchedulerInterface):
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
+            wait_emit("scheduler_recv_notification", req_id)
             logger.debug("Finished recving KV transfer for request %s", req_id)
             assert req_id in self.requests
             req = self.requests[req_id]
