@@ -17,6 +17,7 @@ from vllm.v1.outputs import (
     PoolerOutput,
     RoutedExpertsTensors,
 )
+from vllm.v1.worker.gpu.phase_observation import Observer, mark_phase
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.utils import raise_if_nan_logits
 
@@ -122,10 +123,12 @@ class AsyncOutput(AsyncModelRunnerOutput):
         copy_stream: torch.cuda.Stream,
         check_ep_fault: bool = False,
         routed_experts: RoutedExpertsTensors | None = None,
+        phase_observer: Observer | None = None,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
         # the one where the tensors were created.
+        self.phase_observer = phase_observer
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
@@ -136,6 +139,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
 
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
+            mark_phase(phase_observer, "output_copy_start", stream=copy_stream)
 
             self.sampled_token_ids = async_copy_to_np(sampler_output.sampled_token_ids)
             self.logprobs_tensors: LogprobsTensors | None = None
@@ -162,10 +166,13 @@ class AsyncOutput(AsyncModelRunnerOutput):
             if check_ep_fault:
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
+            mark_phase(phase_observer, "output_copy_end", stream=copy_stream)
             self.copy_event.record(copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:
+        mark_phase(self.phase_observer, "output_wait_begin")
         self.copy_event.synchronize()
+        mark_phase(self.phase_observer, "output_wait_end")
 
         # NOTE(woosuk): The following code is to ensure compatibility with
         # the existing model runner.
@@ -203,6 +210,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 f"Mask: {mask.cpu().tolist()}"
             )
 
+        mark_phase(self.phase_observer, "output_conversion_end")
         return self.model_runner_output
 
 

@@ -131,6 +131,7 @@ from vllm.v1.worker.gpu.lora_utils import (
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
+from vllm.v1.worker.gpu.phase_observation import capture_phase_observer, mark_phase
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler
 from vllm.v1.worker.gpu.sample.batch_shard import (
@@ -1891,15 +1892,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
         )
         # Start async output copy here so that it can overlap with speculator proposal.
+        phase_observer = capture_phase_observer()
+        mark_phase(phase_observer, "sample_before_output_fork", stream=self.main_stream)
         async_output = AsyncOutput(
             model_runner_output=model_runner_output,
             sampler_output=sampler_output,
             num_sampled_tokens=num_sampled,
             main_stream=self.main_stream,
             copy_stream=self.output_copy_stream,
+            phase_observer=phase_observer,
             check_ep_fault=self.check_ep_fault,
             routed_experts=routed_experts,
         )
+        mark_phase(phase_observer, "sample_after_output_fork", stream=self.main_stream)
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
         if self.speculator is not None and self.speculator.supports_mm_inputs:
@@ -1971,6 +1976,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         model_runner_output.kv_connector_output = kv_connector_output
         model_runner_output.ec_connector_output = ec_connector_output
 
+        mark_phase(phase_observer, "sample_tail_end", stream=self.main_stream)
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:

@@ -21,6 +21,7 @@ from vllm.v1.outputs import (
     KVConnectorOutput,
     ModelRunnerOutput,
 )
+from vllm.v1.worker.gpu.phase_observation import observed_host_call, phase_span
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -57,6 +58,7 @@ class ActiveKVConnector(KVConnector):
         self._pending_load_start = False
         self._disabled = False
 
+    @observed_host_call("kv_pre_forward")
     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
         if self._disabled:
             return
@@ -74,6 +76,7 @@ class ActiveKVConnector(KVConnector):
             # their host-side submission cost off the critical path.
             self._pending_load_start = True
 
+    @observed_host_call("kv_start_load")
     def _start_load_kv(self) -> None:
         self._pending_load_start = False
         # TODO: sort out KV Connectors' use of forward_context
@@ -83,6 +86,7 @@ class ActiveKVConnector(KVConnector):
             with set_forward_context(None, self.vllm_config):
                 self.kv_connector.start_load_kv(get_forward_context())
 
+    @observed_host_call("kv_post_forward")
     def post_forward(
         self, finished_req_ids: set[str], wait_for_save: bool = True
     ) -> KVConnectorOutput | None:
@@ -94,10 +98,12 @@ class ActiveKVConnector(KVConnector):
 
         output = KVConnectorOutput()
         if wait_for_save:
-            self.kv_connector.wait_for_save()
-        output.finished_sending, output.finished_recving = (
-            self.kv_connector.get_finished(finished_req_ids)
-        )
+            with phase_span("kv_wait_for_save"):
+                self.kv_connector.wait_for_save()
+        with phase_span("kv_get_finished"):
+            output.finished_sending, output.finished_recving = (
+                self.kv_connector.get_finished(finished_req_ids)
+            )
         output.invalid_block_ids = self.kv_connector.get_block_ids_with_load_errors()
         output.kv_connector_stats = self.kv_connector.get_kv_connector_stats()
         output.kv_cache_events = self.kv_connector.get_kv_connector_kv_cache_events()
@@ -107,6 +113,7 @@ class ActiveKVConnector(KVConnector):
         self.kv_connector.clear_connector_metadata()
         return output
 
+    @observed_host_call("kv_no_forward")
     def no_forward(self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
         if self._disabled:
             return EMPTY_MODEL_RUNNER_OUTPUT

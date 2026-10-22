@@ -24,6 +24,7 @@ from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.serial_utils import run_method
+from vllm.v1.worker.gpu.phase_observation import observed_host_call
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
@@ -87,6 +88,7 @@ class UniProcExecutor(Executor):
         local_rank = int(device_info[1]) if len(device_info) > 1 else 0
         return distributed_init_method, 0, local_rank
 
+    @observed_host_call("uniproc_submit")
     def collective_rpc(  # type: ignore[override]
         self,
         method: str | Callable,
