@@ -583,6 +583,8 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         self.coordinator.free(request.request_id)
+        from vllm.v1 import eviction_probe
+        eviction_probe.request_released(self, request)
 
     def remove_skipped_blocks(
         self,

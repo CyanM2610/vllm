@@ -28,6 +28,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.retirement_observation import retirement_call
 from vllm.v1.request import Request
+from vllm.v1 import eviction_probe
 
 logger = init_logger(__name__)
 
@@ -465,6 +466,9 @@ class BlockPool:
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
+        eviction_probe.cached(request, blocks, num_cached_blocks, num_full_blocks,
+                              block_size, kv_cache_group_id, block_mask)
+
         if self.enable_kv_cache_events:
             if num_cached_blocks == 0:
                 parent_block_hash: ExternalBlockHash | None = None
@@ -831,7 +835,7 @@ class BlockPool:
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
             for block in ret:
-                self._maybe_evict_cached_block(block)
+                self._maybe_evict_cached_block(block, reason="free_pool_reuse")
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
@@ -844,7 +848,7 @@ class BlockPool:
                     self.metrics_collector.on_block_allocated(block)
         return ret
 
-    def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
+    def _maybe_evict_cached_block(self, block: KVCacheBlock, reason: str = "native_invalidation") -> bool:
         """
         If a block is cached in `cached_block_hash_to_block`, we reset its hash
         metadata and evict it from the cache.
@@ -859,11 +863,15 @@ class BlockPool:
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
 
+        probe_ref_cnt = block.ref_cnt
+        probe_num_tokens = block.block_hash_num_tokens
         evicted_hashes = self._remove_cached_block_hashes(block)
         if not evicted_hashes:
             # The block doesn't have hash, eviction is not needed
             return False
 
+        eviction_probe.evicted(block.block_id, evicted_hashes, probe_ref_cnt,
+                               probe_num_tokens, reason)
         self._emit_block_removed_events(evicted_hashes)
         return True
 
