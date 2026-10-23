@@ -210,6 +210,8 @@ class NativeComputeSelection:
                 )
         self.sjf_ids = self.ordered_ids
         self.visits, self.selected = [], {}
+        self.scope_exhausted = False
+        self.intentional_end_reason = None
         self.current_plan, self.plan_invalid, self.fallback_requested = (
             None,
             None,
@@ -432,7 +434,13 @@ class NativeComputeSelection:
                 self.invalidate("native_range_changed")
             else:
                 tokens = quotas[rid]
-                end = rid == self.current_plan["allocations"][-1][0]
+                end = bool(self.current_plan.get("end_compute_reason")) and (
+                    rid == self.current_plan["allocations"][-1][0]
+                    and all(
+                        other == rid or self.selected.get(other, (None, None))[1] == q
+                        for other, q in quotas.items()
+                    )
+                )
         emit(
             "native_compute_proposal",
             request.request_id,
@@ -442,6 +450,7 @@ class NativeComputeSelection:
             native_tokens=native_tokens,
             granted=tokens,
             end_after_commit=end,
+            end_reason=self.current_plan.get("end_compute_reason") if end else None,
             plan_invalid=self.plan_invalid,
         )
         return ComputeGrant(tokens, end)
@@ -449,6 +458,22 @@ class NativeComputeSelection:
     def committed(self, request, start, tokens, branch):
         """Remember only successful native allocations."""
         self.selected[request.request_id] = (start, tokens)
+        if self.current_plan is not None and self.plan_invalid is None:
+            quotas = dict(self.current_plan["allocations"])
+            if all(
+                self.selected.get(rid, (None, None))[1] == q
+                for rid, q in quotas.items()
+            ):
+                self.scope_exhausted = True
+                self.intentional_end_reason = self.current_plan.get(
+                    "end_compute_reason"
+                )
+                emit(
+                    "native_compute_slo_scope_completed",
+                    step=self.snapshot.step_id,
+                    explicit_end_reason=self.intentional_end_reason,
+                    selected_tokens=sum(q for _, q in self.selected.values()),
+                )
         emit(
             "native_compute_selected",
             request.request_id,
@@ -465,7 +490,7 @@ class NativeComputeSelection:
         self.invalidate("same_step_native_rollback")
         emit("native_compute_revoked", rid, step=self.snapshot.step_id)
 
-    def finish(self, output):
+    def finish(self, output, *, remaining_tokens=None, compute_ended=False):
         """Check the one native output, without rewriting it."""
         if {
             rid: q for rid, (_, q) in self.selected.items()
@@ -518,6 +543,25 @@ class NativeComputeSelection:
             step=self.snapshot.step_id,
             actual_checks=len(set(self.visits)),
             selected=dict(output.num_scheduled_tokens),
+            plan_scope_exhausted=self.scope_exhausted,
+            plan_invalid=self.plan_invalid,
+            forecast_executed=(
+                self.current_plan is not None
+                and self.plan_invalid is None
+                and dict(self.current_plan["allocations"])
+                == output.num_scheduled_tokens
+            ),
+            explicit_end_reason=self.intentional_end_reason
+            if self.plan_invalid is None
+            else None,
+            traversal_end_reason=(
+                "token_budget_exhausted"
+                if remaining_tokens == 0
+                else self.intentional_end_reason
+                if compute_ended
+                else "native_traversal_complete"
+            ),
+            remaining_tokens=remaining_tokens,
             **self.timings,
         )
 

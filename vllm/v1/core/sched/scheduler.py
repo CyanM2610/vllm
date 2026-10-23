@@ -405,7 +405,6 @@ class Scheduler(SchedulerInterface):
         _, errors = frozen_config_scope(self.vllm_config, self.block_size)
         limit = extra.get("lmcache.mp.first_match_prepare_limit", 32)
         planned = getattr(self, "_global_plan", None) is not None
-        selection = getattr(self, "_native_compute_selection", None)
         forbidden = ("decoupled_control", "prepare_load_operations",
                      "prepare_lookup_operations", "lookup_independent_progress",
                      "eager_prefetch")
@@ -415,9 +414,8 @@ class Scheduler(SchedulerInterface):
                 or getattr(self, "_global_sjf_input_enabled", False)
                 or getattr(self, "_compute_budget", None) is not None
                 or getattr(self, "_conditional_end_enabled", False)
-                or (selection is not None and selection.mode == "slo")
                 or (not planned and any(extra.get("lmcache.mp."+k, False) for k in forbidden))):
-            raise ValueError("first-match preparation requires the frozen native/SJF or explicit-plan scope: " + repr(errors))
+            raise ValueError("first-match preparation requires the frozen compute-policy or explicit-plan scope: " + repr(errors))
         self._first_match_preparation = FirstMatchPreparation(
             planned=planned, limit=limit, emit=wait_emit)
         wait_emit("prefill_first_match_preparation_enabled", limit=limit,
@@ -2670,7 +2668,8 @@ class Scheduler(SchedulerInterface):
             self.sched_step_seq += 1
 
         if compute_selection is not None:
-            compute_selection.finish(scheduler_output)
+            compute_selection.finish(scheduler_output, remaining_tokens=token_budget,
+                                     compute_ended=compute_batch_end)
         if sjf_order:
             self._global_sjf_observe_step_end(scheduler_output)
         if plan_runtime is not None:

@@ -260,6 +260,28 @@ class FirstMatchPreparationTests(unittest.TestCase):
         )
         self.assertTrue(all(e["visited"] <= 32 for e in summaries))
         self.assertFalse(any(c[0] == "STATUS" for c in f.rpc.calls))
+        self.assertEqual(summaries[0]["cap_not_visited"], 38)
+        self.assertEqual(summaries[0]["query_pending_visited"], 32)
+        self.assertEqual(summaries[1]["max_consecutive_cap_steps"], 2)
+        for i in range(70, 75):
+            s.t.enqueue(f, f"q{i}", 512, i)
+        for _ in range(3):
+            f.scheduler.schedule()
+        self.assertTrue(
+            all(
+                f.adapter.lookup_operation_state(f"q{i}")["submitted"]
+                for i in range(75)
+            )
+        )
+        ended = [
+            e
+            for e in f.rt.events
+            if e["event"] == "prefill_first_match_cap_wait" and e["phase"] == "end"
+        ]
+        self.assertTrue(
+            any(e["args"] == ("q64",) and e["consecutive_steps"] == 2 for e in ended)
+        )
+        self.assertTrue(all(e["duration_ns"] >= 0 for e in ended))
 
     def test_one_observation_per_step_and_pending_does_not_block_ready(self):
         f = fixture("sjf", prepare=True)
@@ -440,7 +462,7 @@ class FirstMatchPreparationTests(unittest.TestCase):
             s.ops.wait_until(lambda f=f: f.adapter.cleanup_status()["pending"] == 0)
             self.assertEqual(f.scheduler.schedule().num_scheduled_tokens, {})
 
-    def test_common_preparation_rejects_slo_and_unbounded_or_blocking_modes(self):
+    def test_common_preparation_rejects_unbounded_or_blocking_modes(self):
         f = fixture("sjf")
         extra = f.scheduler.vllm_config.kv_transfer_config.kv_connector_extra_config
         extra["lmcache.mp.first_match_preparation"] = True
@@ -454,9 +476,6 @@ class FirstMatchPreparationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 f.scheduler._init_first_match_preparation()
             extra.pop("lmcache.mp." + key)
-        f.selection.mode = "slo"  # Guard only; no new SLO planner is tested.
-        with self.assertRaises(ValueError):
-            f.scheduler._init_first_match_preparation()
 
     def test_pending_cancel_then_late_ack_releases_native_source_owner(self):
         f = fixture("sjf", prepare=True)

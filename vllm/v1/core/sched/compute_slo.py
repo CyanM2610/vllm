@@ -22,6 +22,7 @@ class PlanningRequest:
 class FirstBatch:
     name: str
     allocations: tuple[tuple[str, int], ...]
+    end_compute_reason: str | None = None
 
 
 class ModelUnknown(ValueError):
@@ -134,6 +135,7 @@ class CompletionPlanner:
         return dict(
             name=first.name,
             allocations=first.allocations,
+            end_compute_reason=first.end_compute_reason,
             completion_ns=completion,
             margin_ns=margins,
             max_lateness_ns=max(lateness.values(), default=0),
@@ -177,7 +179,16 @@ class CompletionPlanner:
             seen = set()
             for name, order, cap in recipes:
                 check()
-                batch = FirstBatch(name, self.batch(order, remaining, cap))
+                allocations = self.batch(order, remaining, cap)
+                # A deliberate smaller quota is a batch boundary. Exhausting
+                # the modeled set alone is not: native candidates may remain.
+                batch = FirstBatch(
+                    name,
+                    allocations,
+                    "policy_first_batch_cap"
+                    if cap < 2048 and sum(q for _, q in allocations) == cap
+                    else None,
+                )
                 if batch.allocations in seen:
                     continue
                 seen.add(batch.allocations)
