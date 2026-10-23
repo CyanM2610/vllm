@@ -58,6 +58,10 @@ def retirement_call(name: str) -> Callable:
                     name, owner, phase="end", result=result, error=error, **fields
                 )
 
+        if name in ("pool_allocate", "pool_evict"):
+            from vllm.v1.kv_wait_trace import batch_call
+
+            return batch_call(wrapped)
         return wrapped
 
     return decorate

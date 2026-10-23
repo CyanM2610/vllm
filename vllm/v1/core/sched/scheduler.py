@@ -1726,7 +1726,8 @@ class Scheduler(SchedulerInterface):
 
             if global_order:
                 ledger.record(request, 'running', request.num_computed_tokens, num_new_tokens)
-            mark(request, "running_allocated", quota=num_new_tokens)
+            mark(request, "running_allocated", quota=num_new_tokens,
+                 block_ids_delta=new_blocks.get_block_ids())
             if compute_selection is not None:
                 compute_selection.committed(request, request.num_computed_tokens, num_new_tokens, "running")
             if decoupled_control:
