@@ -55,18 +55,30 @@ class ComputeGrant:
     end_after_commit: bool = False
 
 
+@dataclass(frozen=True)
+class RemainingEstimate:
+    prefix_tokens: int
+    remaining_tokens: int
+    work: int
+    source: str
+    observed_ns: int
+    inflight_tokens: int
+    restore_reserved: bool
+
+
 class NativeComputeSelection:
     """Scalar policy state; native scheduler retains all resource ownership."""
 
     def __init__(self, config, hf_config, *, local_clock=None):
         self.mode = config["mode"]
-        if self.mode not in ("native", "sjf", "slo"):
-            raise ValueError("supported native compute modes: native, sjf, slo")
+        if self.mode not in ("native", "sjf", "slo", "srpt"):
+            raise ValueError("supported native compute modes: native, sjf, slo, srpt")
         self.model = ComputeCostModel.from_config(hf_config)
         self.local_clock = clock_identity() if local_clock is None else local_clock
         self.reader = CandidateReader()
         self.arrivals = {}
         self.keys = {}
+        self.remaining = {}
         self.ordered_ids = ()
         self.snapshot = None
         self.visits = []
@@ -187,6 +199,16 @@ class NativeComputeSelection:
         read_wall, read_cpu = perf_counter_ns() - wall, thread_time_ns() - cpu
         wall, cpu = perf_counter_ns(), thread_time_ns()
         native = [r.request_id for r in self.snapshot.requests]
+        self.remaining = {}
+        estimate_wall, estimate_cpu = perf_counter_ns(), thread_time_ns()
+        if self.mode == "srpt":
+            for request in self.snapshot.requests:
+                if request.request_id in self.keys:
+                    self.remaining[request.request_id] = self.estimate_remaining(
+                        request
+                    )
+        estimate_wall = perf_counter_ns() - estimate_wall
+        estimate_cpu = thread_time_ns() - estimate_cpu
         known = sorted((rid for rid in native if rid in self.keys), key=self.sort_key)
         stream = iter(known)
         ordered = (
@@ -224,6 +246,8 @@ class NativeComputeSelection:
             snapshot_thread_cpu_ns=read_cpu,
             plan_wall_ns=perf_counter_ns() - wall,
             plan_thread_cpu_ns=thread_time_ns() - cpu,
+            remaining_estimate_wall_ns=estimate_wall,
+            remaining_estimate_thread_cpu_ns=estimate_cpu,
         )
         changed = native != list(self.ordered_ids)
         fields = dict(
@@ -242,8 +266,38 @@ class NativeComputeSelection:
                 proposed_order=list(self.ordered_ids),
                 candidates_detail=[asdict(r) for r in self.snapshot.requests],
                 keys={rid: asdict(self.keys[rid]) for rid in known},
+                remaining={rid: asdict(v) for rid, v in self.remaining.items()},
             )
         emit("native_compute_plan", **fields)
+
+    def estimate_remaining(self, request):
+        """Estimate unsubmitted input work, never readiness or resource ownership.
+
+        Accounted positions include irrevocable in-flight submissions and LOAD
+        reservations. Native branches still gate execution. Unowned WAITING
+        requests use the most recent *already observed* complete match; this
+        scalar may be stale and is rechecked by the native takeover path.
+        """
+        if request.held_hbm_blocks or request.accounted_tokens:
+            prefix = min(request.input_tokens, request.accounted_tokens)
+            source, observed = "native_accounted_unsubmitted", self.snapshot.observed_ns
+        elif request.last_match is not None:
+            prefix = request.last_match.matched_tokens
+            source, observed = "last_observed_match", request.last_match.observed_ns
+        else:
+            key = self.keys[request.request_id]
+            prefix = key.prefix_tokens
+            source, observed = "first_observed_match", key.frozen_ns
+        remaining = request.input_tokens - prefix
+        return RemainingEstimate(
+            prefix,
+            remaining,
+            self.model.estimate(remaining, prefix),
+            source,
+            observed,
+            request.inflight_tokens,
+            request.restore_reserved,
+        )
 
     def plan_slo(self):
         """Forecast only scalar states with known native predecessors."""
@@ -403,7 +457,8 @@ class NativeComputeSelection:
 
     def sort_key(self, rid):
         arrival = self.arrivals[rid]
-        return self.keys[rid].work, arrival.arrival_time, arrival.sequence
+        work = self.remaining[rid].work if self.mode == "srpt" else self.keys[rid].work
+        return work, arrival.arrival_time, arrival.sequence
 
     def observe(self, request, **fields):
         """Record real checks; presence in a candidate list is not readiness."""
@@ -452,6 +507,13 @@ class NativeComputeSelection:
             end_after_commit=end,
             end_reason=self.current_plan.get("end_compute_reason") if end else None,
             plan_invalid=self.plan_invalid,
+            frozen_work=self.keys[request.request_id].work
+            if request.request_id in self.keys
+            else None,
+            remaining_estimate=asdict(self.remaining[request.request_id])
+            if request.request_id in self.remaining
+            else None,
+            actual_remaining_tokens=max(0, request.num_prompt_tokens - start),
         )
         return ComputeGrant(tokens, end)
 
