@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Compute-only selection on the native matching and admission paths.
+"""Compute selection sharing native matching, admission and runtime preparation.
 
 Unknown keys keep their native traversal slots. Known keys are sorted only
-inside the remaining slots. A native match freezes a key for the next step;
-it does not trigger another traversal or acquire any additional resources.
+inside the remaining slots. A match observed during traversal participates next
+step; optional runtime preparation publishes it before this step's selection.
+Neither observation acquires HBM or determines physical readiness.
 """
 
 from dataclasses import asdict, dataclass
@@ -70,6 +71,7 @@ class NativeComputeSelection:
         self.snapshot = None
         self.visits = []
         self.selected = {}
+        self.first_allocated = set()
         self.witnesses = 0
         self.planner = (
             CompletionPlanner(config["completion_model"])
@@ -91,7 +93,10 @@ class NativeComputeSelection:
             model=self.model.to_dict(),
             clock_id=self.local_clock,
             slo_ns=3_000_000_000,
-            unknown_merge="native slots retained; known slots sorted; new key next step",
+            unknown_merge=(
+                "native slots retained; known slots sorted; "
+                "runtime preparation before selection, traversal match next step"
+            ),
             completion_model=config.get("completion_model"),
         )
 
@@ -125,13 +130,16 @@ class NativeComputeSelection:
             metadata_present=eligible is not None,
         )
 
-    def matched(self, request, local, external, matched, step):
+    def matched(
+        self, request, local, external, matched, step, *, source="native", first=None
+    ):
         """Observe the complete native merge; retain no physical block pointer."""
         rid = request.request_id
         now = monotonic_ns()
         self.reader.matches[rid] = MatchObservation(local, external, matched, now, step)
         if rid not in self.keys:
-            length = request.num_prompt_tokens
+            length = request.num_prompt_tokens if first is None else first.input_tokens
+            matched = matched if first is None else first.prefix_tokens
             if not 0 <= matched < length:
                 emit(
                     "native_compute_key_unknown",
@@ -147,8 +155,8 @@ class NativeComputeSelection:
                 matched,
                 remaining,
                 self.model.estimate(remaining, matched),
-                now,
-                step,
+                now if first is None else first.observed_ns,
+                step if first is None else first.step_id,
             )
             emit(
                 "native_compute_key_frozen",
@@ -156,8 +164,10 @@ class NativeComputeSelection:
                 **asdict(self.keys[rid]),
                 a=self.model.a,
                 b=self.model.b,
-                participation="next_step",
-                source="complete_native_match",
+                participation="current_selection"
+                if source == "first_prepare"
+                else "next_step",
+                source=source,
             )
         else:
             emit(
@@ -185,6 +195,19 @@ class NativeComputeSelection:
             else native
         )
         self.ordered_ids = tuple(ordered)
+        participated = getattr(self, "_participated_keys", None)
+        if participated is None:
+            participated = self._participated_keys = set()
+        for rid in known:
+            if rid not in participated:
+                participated.add(rid)
+                emit(
+                    "native_compute_key_first_selection",
+                    rid,
+                    step=scheduler.current_step,
+                    frozen_step=self.keys[rid].step,
+                    prior_compute=scheduler.requests[rid].num_computed_tokens,
+                )
         self.sjf_ids = self.ordered_ids
         self.visits, self.selected = [], {}
         self.current_plan, self.plan_invalid, self.fallback_requested = (
@@ -345,7 +368,10 @@ class NativeComputeSelection:
             changed_from_sjf=result.get("changed_from_sjf", False),
             wall_ns=result["wall_ns"],
             thread_cpu_ns=result["thread_cpu_ns"],
-            scope="conditional completion prediction; native admission remains authoritative",
+            scope=(
+                "conditional completion prediction; "
+                "native admission remains authoritative"
+            ),
         )
         if self.slo_witnesses < 8 and chosen and len(modeled) > 1:
             self.slo_witnesses += 1
@@ -450,6 +476,17 @@ class NativeComputeSelection:
         self.reader.worker_initialized.update(
             r.req_id for r in output.scheduled_new_reqs
         )
+        for rid, (start, tokens) in self.selected.items():
+            if rid not in self.first_allocated:
+                self.first_allocated.add(rid)
+                emit(
+                    "native_compute_first_allocation",
+                    rid,
+                    step=self.snapshot.step_id,
+                    start=start,
+                    tokens=tokens,
+                    frozen_step=self.keys[rid].step if rid in self.keys else None,
+                )
         output._native_compute_step_id = self.snapshot.step_id
         if self.planner is not None and self.selected:
             now = monotonic_ns()
@@ -494,5 +531,8 @@ class NativeComputeSelection:
                 step=step,
                 observed_ns=monotonic_ns(),
                 predicted_gpu_end_ns=batch["gpu_end_ns"],
-                scope="scheduler observation of worker output, not GPU completion timestamp",
+                scope=(
+                    "scheduler observation of worker output, "
+                    "not GPU completion timestamp"
+                ),
             )

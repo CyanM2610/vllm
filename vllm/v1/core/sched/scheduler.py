@@ -389,6 +389,41 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills: set[Request] = set()
         self._init_prefill_operations()
         self._init_native_compute_selection()
+        self._init_first_match_preparation()
+
+    def _init_first_match_preparation(self):
+        config = self.vllm_config.kv_transfer_config
+        extra = (config.kv_connector_extra_config or {}) if config else {}
+        enabled = extra.get("lmcache.mp.first_match_preparation", False)
+        if type(enabled) is not bool:
+            raise ValueError("first_match_preparation must be bool")
+        self._first_match_preparation = None
+        if not enabled:
+            return
+        from vllm.v1.core.sched.prepared_prefix_match import FirstMatchPreparation
+        from vllm.v1.core.sched.global_sjf_input import frozen_config_scope
+        _, errors = frozen_config_scope(self.vllm_config, self.block_size)
+        limit = extra.get("lmcache.mp.first_match_prepare_limit", 32)
+        planned = getattr(self, "_global_plan", None) is not None
+        selection = getattr(self, "_native_compute_selection", None)
+        forbidden = ("decoupled_control", "prepare_load_operations",
+                     "prepare_lookup_operations", "lookup_independent_progress",
+                     "eager_prefetch")
+        if (errors or type(limit) is not int or not 1 <= limit <= 32
+                or self._action_feedback is None
+                or not extra.get("lmcache.mp.nonblocking_lookup_status", True)
+                or getattr(self, "_global_sjf_input_enabled", False)
+                or getattr(self, "_compute_budget", None) is not None
+                or getattr(self, "_conditional_end_enabled", False)
+                or (selection is not None and selection.mode == "slo")
+                or (not planned and any(extra.get("lmcache.mp."+k, False) for k in forbidden))):
+            raise ValueError("first-match preparation requires the frozen native/SJF or explicit-plan scope: " + repr(errors))
+        self._first_match_preparation = FirstMatchPreparation(
+            planned=planned, limit=limit, emit=wait_emit)
+        wait_emit("prefill_first_match_preparation_enabled", limit=limit,
+                  mode="plan_cached_only" if planned else "common_query_prepare",
+                  new_lookup_allowed=not planned, match_accounting=False,
+                  query_observation="once_per_request_per_step")
 
     def _init_native_compute_selection(self, config=None):
         """Opt-in compute-only policy; no independent transfer/control entry."""
@@ -1082,7 +1117,9 @@ class Scheduler(SchedulerInterface):
         )
         return result
 
-    def _match_waiting_prefix(self, request, phase="native", existing_lookup_only=False):
+    def _match_waiting_prefix(self, request, phase="native", existing_lookup_only=False,
+                              *, allow_lookup_submit=None, allow_lookup_progress=None,
+                              commit_match=None):
         # Extracted from the frozen WAITING path. Blocks are ephemeral and are
         # adopted only by allocate_slots in the same synchronous admission.
         num_external_computed_tokens = 0
@@ -1111,12 +1148,23 @@ class Scheduler(SchedulerInterface):
                 num_new_local_computed_tokens - partial_tail
             )
             method = self.connector.get_num_new_matched_tokens
-            if phase == "prepare":
+            explicit_permissions = allow_lookup_submit is not None
+            if explicit_permissions:
+                method = self.connector.match_prefix_tokens
+            elif phase == "prepare" and existing_lookup_only:
+                method = self.connector.match_prefix_tokens
+                explicit_permissions = True
+                allow_lookup_submit, allow_lookup_progress, commit_match = False, False, False
+            elif phase == "prepare":
                 method = self.connector.observe_num_new_matched_tokens
             elif existing_lookup_only:
                 method = self.connector.get_num_new_matched_tokens_from_existing_lookup
             lookup_started = time.monotonic_ns()
-            ext_tokens, load_kv_async = method(request, block_aligned_local)
+            ext_tokens, load_kv_async = method(
+                request, block_aligned_local,
+                **(dict(allow_lookup_submit=allow_lookup_submit,
+                        allow_lookup_progress=allow_lookup_progress,
+                        commit_match=commit_match) if explicit_permissions else {}))
             lookup_elapsed = time.monotonic_ns() - lookup_started
             counters = getattr(self, "_prefix_match_attempt_counts", None)
             if counters is None:
@@ -1186,16 +1234,21 @@ class Scheduler(SchedulerInterface):
             self._global_plan.matches[request.request_id] = MatchObservation(
                 num_new_local_computed_tokens, num_external_computed_tokens,
                 num_computed_tokens, time.monotonic_ns(), self.current_step)
-        selection = getattr(self, "_native_compute_selection", None)
-        if selection is not None:
-            selection.matched(request, num_new_local_computed_tokens,
-                              num_external_computed_tokens, num_computed_tokens,
-                              self.current_step)
-        return PrefixMatch(
+        result = PrefixMatch(
             new_computed_blocks, num_new_local_computed_tokens,
             num_external_computed_tokens, num_computed_tokens, load_kv_async,
             shared_prefix_boundary, connector_prefix_cache_queries,
         )
+        preparation = getattr(self, "_first_match_preparation", None)
+        if preparation is not None:
+            preparation.record(request, result, self.current_step, phase)
+        selection = getattr(self, "_native_compute_selection", None)
+        if selection is not None:
+            selection.matched(request, num_new_local_computed_tokens,
+                              num_external_computed_tokens, num_computed_tokens,
+                              self.current_step, source=phase,
+                              first=preparation.first[request.request_id] if preparation else None)
+        return result
 
     def _get_local_prefix_cache_hit(
         self, request: Request
@@ -1276,6 +1329,9 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+        preparation = getattr(self, "_first_match_preparation", None)
+        if preparation is not None:
+            preparation.begin_step(self)
         decoupled_control = getattr(self, "_decoupled_control", False)
         operations_enabled = getattr(self, "_prefill_operations_enabled", False)
         if operations_enabled:
@@ -1294,6 +1350,8 @@ class Scheduler(SchedulerInterface):
             self._compute_budget_begin()
 
         plan_runtime = getattr(self, "_global_plan", None)
+        if preparation is not None:
+            preparation.prepare(self)
         if plan_runtime is not None:
             self._operation_budget, self._operation_input_budget = token_budget, input_budget
             stats = plan_runtime.begin(self, token_budget, input_budget)
@@ -1814,6 +1872,11 @@ class Scheduler(SchedulerInterface):
             did_prefix_cache_lookup = False
             # Get already-cached tokens.
             if request.num_computed_tokens == 0:
+                if (preparation is not None
+                        and request_id not in preparation.first):
+                    mark(request, "first_match_not_prepared")
+                    defer_waiting_request()
+                    return True
                 did_prefix_cache_lookup = True
                 prepared = getattr(self, "_global_sjf_match_prepare", False)
                 match = self._match_waiting_prefix(
@@ -1823,6 +1886,8 @@ class Scheduler(SchedulerInterface):
                         compute_budget_enabled
                         and request.request_id in self._compute_budget_retry_matches
                     ),
+                    **(dict(allow_lookup_submit=False, allow_lookup_progress=True,
+                            commit_match=True) if preparation is not None else {}),
                 )
                 if match is None:
                     mark(request, "lookup_pending")
@@ -3702,6 +3767,9 @@ class Scheduler(SchedulerInterface):
             selection = getattr(self, "_native_compute_selection", None)
             if selection is not None:
                 selection.register(request)
+            preparation = getattr(self, "_first_match_preparation", None)
+            if preparation is not None:
+                preparation.register(request)
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.spec_decode_metrics_level != "none":

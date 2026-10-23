@@ -10,6 +10,7 @@ from enum import Enum
 from time import monotonic_ns, perf_counter_ns, thread_time_ns
 
 from vllm.v1.core.sched.prefill_operations import ActionKind, OperationAction
+from vllm.v1.core.sched.prepared_prefix_match import FirstMatch
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,7 @@ class RequestCandidate:
     dependencies: tuple[tuple[str, str], ...]
     native_lookup_fallback: str | None = None
     restore_failed: bool = False
+    first_match: FirstMatch | None = None
 
 
 @dataclass(frozen=True)
@@ -219,6 +221,8 @@ class CandidateReader:
                     received, adopted, len(manager.req_to_blocks.get(rid, ())), blockers,
                     query.get("native_fallback_reason"),
                     rid in scheduler.failed_recving_kv_req_ids,
+                    (scheduler._first_match_preparation.first.get(rid)
+                     if getattr(scheduler, "_first_match_preparation", None) else None),
                 ))
         operations = [_operation(v, bool(v.get("retained_store")), self.sequences.get(v["request_id"]))
                       for v in connector.get_global_operation_snapshot()]
