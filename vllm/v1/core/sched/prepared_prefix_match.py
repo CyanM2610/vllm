@@ -16,6 +16,10 @@ class PrefixMatch:
     load_kv_async: bool
     shared_prefix_boundary: int
     connector_queries: int
+    # Ephemeral local-only match, before a longer external prefix trims a tail.
+    # Never published in a policy snapshot or retained across scheduler steps.
+    local_only_blocks: Any = None
+    local_only_tokens: int | None = None
 
 
 @dataclass(frozen=True)

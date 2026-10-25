@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 from time import monotonic_ns, perf_counter_ns, thread_time_ns
 
-from vllm.v1.core.sched.prefill_operations import ActionKind, OperationAction
+from vllm.v1.core.sched.prefill_operations import ActionKind, OperationAction, ResultKind
 from vllm.v1.core.sched.prepared_prefix_match import FirstMatch
 
 
@@ -20,6 +20,7 @@ class MatchObservation:
     matched_tokens: int
     observed_ns: int
     step_id: int
+    local_only_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,7 @@ class RequestCandidate:
     native_lookup_fallback: str | None = None
     restore_failed: bool = False
     first_match: FirstMatch | None = None
+    committed_recovery_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -93,6 +95,7 @@ class CandidateSnapshot:
     complete_request_view: bool = True
     omitted_requests: int = 0
     physical_completion_scope: str = "only native received/adopted evidence; no device polling"
+    recovery_path_choice_enabled: bool = False
 
 
 class OperationKind(str, Enum):
@@ -101,12 +104,37 @@ class OperationKind(str, Enum):
     COMPUTE = "compute"
 
 
+class RecoveryPath(str, Enum):
+    RESTORE = "restore"
+    RECOMPUTE = "recompute"
+
+
+@dataclass(frozen=True)
+class RecoveryPathFeedback:
+    snapshot_id: str
+    step_id: int
+    request_id: str
+    path: RecoveryPath
+    result: ResultKind
+    reason: str
+    proposed_l: int
+    proposed_h: int | None
+    proposed_p: int | None
+    actual_h: int | None = None
+    actual_p: int | None = None
+    # Native effective prefix reservation; chunked DMA range is in metadata.
+    reserved_external_tokens: int = 0
+    compute_tokens: int = 0
+    observed_ns: int = 0
+
+
 @dataclass(frozen=True)
 class PlanItem:
     kind: OperationKind
     request_id: str
     max_tokens: int | None = None
     end_after_commit: bool = False
+    recovery_path: RecoveryPath | None = None
 
 
 @dataclass(frozen=True)
@@ -223,6 +251,7 @@ class CandidateReader:
                     rid in scheduler.failed_recving_kv_req_ids,
                     (scheduler._first_match_preparation.first.get(rid)
                      if getattr(scheduler, "_first_match_preparation", None) else None),
+                    getattr(self, "path_commits", {}).get(rid),
                 ))
         operations = [_operation(v, bool(v.get("retained_store")), self.sequences.get(v["request_id"]))
                       for v in connector.get_global_operation_snapshot()]
@@ -246,12 +275,14 @@ class CandidateReader:
             bool(scheduler._decoupled_control and connector.prepare_load_operations),
             bool(connector.decoupled_store_enabled),
             self.new_lookup, self.lookup_limit, self.load_limit,
+            recovery_path_choice_enabled=getattr(self, "recovery_path_choice", False),
         )
 
 
 class PlanRuntime(CandidateReader):
     """Plan validation/accounting only. Native owners perform all side effects."""
-    def __init__(self, *, new_lookup=False, lookup_limit=32, load_limit=32):
+    def __init__(self, *, new_lookup=False, lookup_limit=32, load_limit=32,
+                 recovery_path_choice=False):
         self.policy = NativePlan()
         self.sequences = {}
         self.sequence = 0
@@ -271,6 +302,10 @@ class PlanRuntime(CandidateReader):
         self.check_cpu_ns = 0
         self.check_wall_ns = 0
         self.timings = deque(maxlen=128)
+        self.recovery_path_choice = recovery_path_choice
+        # Commitment observations only: no resources, Request refs or block IDs.
+        self.path_commits = {}
+        self.path_feedback = deque(maxlen=128)
 
     def begin(self, scheduler, token_budget, input_budget):
         # Retirement is outside the pure reader and does not hold Request refs.
@@ -282,6 +317,7 @@ class PlanRuntime(CandidateReader):
             self.sequences.pop(rid)
             self.matches.pop(rid, None)
             self.worker_initialized.discard(rid)
+            self.path_commits.pop(rid, None)
         wall, cpu = perf_counter_ns(), thread_time_ns()
         plan = scheduler._action_feedback._callback(self.policy.plan, snapshot)
         plan_time = (perf_counter_ns()-wall, thread_time_ns()-cpu)
@@ -347,6 +383,15 @@ class PlanRuntime(CandidateReader):
                 raise ValueError("positive token cap only applies to COMPUTE")
             if item.end_after_commit and item.kind != OperationKind.COMPUTE:
                 raise ValueError("end_after_commit only applies to COMPUTE")
+            if item.recovery_path is not None:
+                if not snapshot.recovery_path_choice_enabled:
+                    raise ValueError("explicit recovery paths require recovery_path_choice=true")
+                if not isinstance(item.recovery_path, RecoveryPath):
+                    raise TypeError("recovery_path must be RecoveryPath")
+                expected = (OperationKind.LOAD if item.recovery_path == RecoveryPath.RESTORE
+                            else OperationKind.COMPUTE)
+                if item.kind != expected:
+                    raise ValueError("RESTORE authorizes LOAD; RECOMPUTE requires a COMPUTE item")
             key = (item.kind, item.request_id)
             if key in attempts:
                 duplicates += 1
@@ -390,13 +435,49 @@ class PlanRuntime(CandidateReader):
         if callback is not None:
             callback(result)
 
+    def report_path(self, scheduler, request, result, reason, *, match=None, quota=0):
+        """Publish selection evidence without creating another resource owner."""
+        item = self.active_item
+        if item is None or item.request_id != request.request_id or item.recovery_path is None:
+            return
+        from dataclasses import asdict
+        from vllm.v1.kv_wait_trace import emit
+
+        initial = self.request_views[request.request_id]
+        previous = initial.last_match
+        h = None if match is None else match.local_only_tokens
+        p = None if match is None else match.matched_tokens
+        evidence = RecoveryPathFeedback(
+            self.snapshot.snapshot_id, self.snapshot.step_id, request.request_id,
+            item.recovery_path, result, reason, initial.input_tokens,
+            (previous.local_only_tokens if previous.local_only_tokens is not None
+             else previous.local_tokens) if previous else None,
+            previous.matched_tokens if previous else None, h, p,
+            (match.external_tokens if match and item.recovery_path == RecoveryPath.RESTORE
+             and result == ResultKind.RESOURCES_ACQUIRED else 0),
+            quota, monotonic_ns())
+        self.path_feedback.append(evidence)
+        fields = asdict(evidence)
+        fields.pop("request_id")
+        emit("prefill_recovery_path", request.request_id, **fields)
+        callback = getattr(self.policy, "on_recovery_path_feedback", None)
+        if callback is not None:
+            scheduler._action_feedback._callback(callback, evidence)
+
     def call_native(self, function, *args, **kwargs):
         wall, cpu = perf_counter_ns(), thread_time_ns()
         try:
             return function(*args, **kwargs)
         finally:
-            self.native_wall_ns += perf_counter_ns()-wall
-            self.native_cpu_ns += thread_time_ns()-cpu
+            elapsed, cpu_elapsed = perf_counter_ns()-wall, thread_time_ns()-cpu
+            self.native_wall_ns += elapsed
+            self.native_cpu_ns += cpu_elapsed
+            if self.active_item is not None and self.active_item.recovery_path is not None:
+                from vllm.v1.kv_wait_trace import emit
+                emit("prefill_recovery_path_cpu", self.active_item.request_id,
+                     step=self.snapshot.step_id, path=self.active_item.recovery_path,
+                     wall_ns=elapsed, thread_cpu_ns=cpu_elapsed,
+                     scope="native attempt including nested checks; not additive to scheduler time")
 
     def final_stats(self, output):
         self.worker_initialized.update(r.req_id for r in output.scheduled_new_reqs)

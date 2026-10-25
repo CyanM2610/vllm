@@ -454,6 +454,9 @@ class Scheduler(SchedulerInterface):
         extra = (config.kv_connector_extra_config or {}) if config else {}
         enabled = extra.get("lmcache.mp.action_feedback", False)
         global_plan = extra.get("lmcache.mp.global_plan", False)
+        recovery_path_choice = extra.get("lmcache.mp.recovery_path_choice", False)
+        if type(recovery_path_choice) is not bool or (recovery_path_choice and not global_plan):
+            raise ValueError("recovery_path_choice requires explicit global_plan=true")
         if type(global_plan) is not bool or (global_plan and not enabled):
             raise ValueError("global_plan requires explicit action_feedback=true")
         self._global_plan = None
@@ -553,7 +556,8 @@ class Scheduler(SchedulerInterface):
             if type(new_lookup) is not bool or any(type(v) is not int or v <= 0 for v in (lookup_limit, load_limit)):
                 raise ValueError("plan limits must be positive integers; plan_new_lookup must be bool")
             self._global_plan = PlanRuntime(new_lookup=new_lookup,
-                lookup_limit=lookup_limit, load_limit=load_limit)
+                lookup_limit=lookup_limit, load_limit=load_limit,
+                recovery_path_choice=recovery_path_choice)
             self._action_feedback.policy = self._global_plan
         if self.connector.decoupled_store_enabled:
             self.connector.set_operation_decider(self._decide_store_operation)
@@ -1129,6 +1133,8 @@ class Scheduler(SchedulerInterface):
             shared_prefix_boundary,
             hit_diverged,
         ) = self._timed_local_prefix_cache_hit(request, phase)
+        local_only_blocks = new_computed_blocks
+        local_only_tokens = num_new_local_computed_tokens
         if phase == "native":
             request.shared_prefix_boundary = shared_prefix_boundary
         wait_emit(
@@ -1231,11 +1237,13 @@ class Scheduler(SchedulerInterface):
             from vllm.v1.core.sched.global_plan import MatchObservation
             self._global_plan.matches[request.request_id] = MatchObservation(
                 num_new_local_computed_tokens, num_external_computed_tokens,
-                num_computed_tokens, time.monotonic_ns(), self.current_step)
+                num_computed_tokens, time.monotonic_ns(), self.current_step,
+                local_only_tokens)
         result = PrefixMatch(
             new_computed_blocks, num_new_local_computed_tokens,
             num_external_computed_tokens, num_computed_tokens, load_kv_async,
             shared_prefix_boundary, connector_prefix_cache_queries,
+            local_only_blocks, local_only_tokens,
         )
         preparation = getattr(self, "_first_match_preparation", None)
         if preparation is not None:
@@ -1392,6 +1400,12 @@ class Scheduler(SchedulerInterface):
                           step=self.current_step, **fields)
 
         def mark(request, reason, **fields):
+            if plan_runtime is not None and reason in (
+                "lookup_pending", "blocked_waiting_dependency", "stale_output_pending",
+                "operation_max_num_seqs",
+            ):
+                from vllm.v1.core.sched.prefill_operations import ResultKind
+                plan_runtime.report_path(self, request, ResultKind.BLOCKED, reason)
             if plan_runtime is not None and reason in ("running_visited", "waiting_visited"):
                 plan_runtime.checked.add(request.request_id)
                 plan_runtime.check_count += 1
@@ -1800,6 +1814,10 @@ class Scheduler(SchedulerInterface):
                 return False
             request = request_queue.peek_request()
             request_id = request.request_id
+            path_choice = None
+            path_match = None
+            if explicit_plan and plan_runtime.active_item is not None:
+                path_choice = plan_runtime.active_item.recovery_path
             def skip_policy_candidate():
                 policy_skipped.add(request_id)
                 if not restore_only:
@@ -1892,6 +1910,25 @@ class Scheduler(SchedulerInterface):
                     mark(request, "lookup_pending")
                     defer_waiting_request()
                     return True
+                if path_choice is not None:
+                    from vllm.v1.core.sched.global_plan import RecoveryPath
+                    from vllm.v1.core.sched.prefill_operations import ResultKind
+                    # Native matching may have observed a query failure. A
+                    # stale snapshot is not permission to commit either path.
+                    if not self.connector.lookup_operation_state(request_id)["result_known"]:
+                        plan_runtime.report_path(self, request, ResultKind.BLOCKED,
+                                                 "complete_match_no_longer_valid", match=match)
+                        return True
+                    path_match = match
+                    plan_runtime.report_path(self, request, ResultKind.NOT_ATTEMPTED,
+                                             "takeover_match_confirmed", match=match)
+                    if path_choice == RecoveryPath.RECOMPUTE:
+                        # Local blocks are fresh references from this very
+                        # synchronous admission; only allocate_slots adopts them.
+                        from dataclasses import replace
+                        match = replace(match, blocks=match.local_only_blocks,
+                            local_tokens=match.local_only_tokens, external_tokens=0,
+                            matched_tokens=match.local_only_tokens, load_kv_async=False)
                 new_computed_blocks = match.blocks
                 num_new_local_computed_tokens = match.local_tokens
                 num_external_computed_tokens = match.external_tokens
@@ -1932,6 +1969,10 @@ class Scheduler(SchedulerInterface):
                 mark(request, "plan_compute_requires_LOAD")
                 return True
             if restore_only and not load_kv_async:
+                if path_choice is not None:
+                    from vllm.v1.core.sched.prefill_operations import ResultKind
+                    plan_runtime.report_path(self, request, ResultKind.NOT_REQUIRED,
+                        "current_hbm_needs_no_restore", match=path_match)
                 if explicit_plan:
                     from vllm.v1.core.sched.prefill_operations import ResultKind
                     evidence = self._action_attempt(request, "load", num_new_local_computed_tokens, num_computed_tokens)
@@ -2121,6 +2162,20 @@ class Scheduler(SchedulerInterface):
                     return False
                 num_new_tokens = proposal.tokens
                 action_end_after_commit = proposal.end_after_commit
+            recompute_takeover = explicit_plan and (
+                (path_choice is not None and path_choice.value == "recompute")
+                or plan_runtime.path_commits.get(request_id) == "recompute"
+            )
+            if recompute_takeover:
+                try:
+                    self.connector.validate_recompute_path(request, num_computed_tokens)
+                except ValueError as error:
+                    if path_choice is None:
+                        raise  # A committed native re-entry must obey its contract.
+                    from vllm.v1.core.sched.prefill_operations import ResultKind
+                    plan_runtime.report_path(self, request, ResultKind.BLOCKED,
+                        "recompute_precondition_failed:" + str(error), match=path_match)
+                    return True
             new_blocks = self.kv_cache_manager.allocate_slots(
                 request,
                 num_new_tokens,
@@ -2135,6 +2190,10 @@ class Scheduler(SchedulerInterface):
                 has_scheduled_reqs=bool(self.running),
             )
             if new_blocks is None:
+                if path_choice is not None:
+                    from vllm.v1.core.sched.prefill_operations import ResultKind
+                    plan_runtime.report_path(self, request, ResultKind.BLOCKED,
+                        "capacity_failed", match=path_match)
                 mark(request, 'waiting_allocation_failed')
                 if (compute_budget_enabled and not load_kv_async
                         and self._compute_budget.mode != "off"):
@@ -2159,6 +2218,8 @@ class Scheduler(SchedulerInterface):
             # This information is used to determine if a load is
             # needed for this request.
             if self.connector is not None:
+                if recompute_takeover:
+                    self.connector.commit_recompute_path(request, num_computed_tokens)
                 self.connector.update_state_after_alloc(
                     request,
                     self.kv_cache_manager.get_blocks(request_id),
@@ -2173,6 +2234,11 @@ class Scheduler(SchedulerInterface):
                         num_hits=connector_prefix_cache_hits,
                         preempted=request.num_preemptions > 0,
                     )
+            if path_choice is not None:
+                from vllm.v1.core.sched.prefill_operations import ResultKind
+                plan_runtime.path_commits[request_id] = path_choice.value
+                plan_runtime.report_path(self, request, ResultKind.RESOURCES_ACQUIRED,
+                    "path_committed", match=path_match, quota=num_new_tokens)
             if conditional_end:
                 self._conditional_adopted(request)
             # Record at admission so unscheduled lookups are not counted.
@@ -2384,6 +2450,7 @@ class Scheduler(SchedulerInterface):
             if explicit_plan:
                 dispatch_wall, dispatch_cpu = time.perf_counter_ns(), time.thread_time_ns()
                 from vllm.v1.core.sched.global_plan import OperationKind
+                from vllm.v1.core.sched.prefill_operations import ResultKind
             if sjf_order:
                 entries = [(r, None) for r in self._global_sjf_candidates()]
             elif compute_order:
@@ -2400,6 +2467,24 @@ class Scheduler(SchedulerInterface):
                 if explicit_plan:
                     plan_runtime.active_item = entry
                     initial = plan_runtime.request_views[rid]
+                    if entry.recovery_path is not None:
+                        from vllm.v1.core.sched.prefill_operations import ResultKind
+                        plan_runtime.report_path(self, request, ResultKind.NOT_ATTEMPTED,
+                                                 "proposed")
+                        held = self.kv_cache_manager.coordinator.single_type_managers[0].req_to_blocks.get(rid, ())
+                        if (rid in plan_runtime.path_commits or held
+                                or request.status != RequestStatus.WAITING
+                                or request.num_preemptions or request.num_computed_tokens
+                                or request.num_in_flight_tokens or request.num_output_placeholders
+                                or request.num_stale_output_tokens):
+                            plan_runtime.report_path(self, request, ResultKind.NOT_ATTEMPTED,
+                                                     "unsupported_after_first_takeover")
+                            continue
+                        state = self.connector.lookup_operation_state(rid)
+                        if not initial.lookup_result_known or initial.last_match is None or not state["result_known"]:
+                            plan_runtime.report_path(self, request, ResultKind.BLOCKED,
+                                                     "complete_match_required")
+                            continue
                     if entry.kind == OperationKind.LOOKUP:
                         if (self._pause_state != PauseState.UNPAUSED
                                 or plan_runtime.lookup_attempted >= plan_runtime.lookup_limit):
@@ -2424,10 +2509,13 @@ class Scheduler(SchedulerInterface):
                     if entry.kind == OperationKind.LOAD:
                         if (self._pause_state != PauseState.UNPAUSED or preempted_reqs
                                 or plan_runtime.load_attempted >= plan_runtime.load_limit):
+                            plan_runtime.report_path(self, request, ResultKind.NOT_ATTEMPTED,
+                                                     "load_limit_or_pause")
                             observe_global(request, kind="load", outcome="not_checked", reason="load_limit_or_pause")
                             continue
                         plan_runtime.load_attempted += 1
-                        if (not initial.lookup_result_known or initial.lookup_result_tokens <= 0
+                        if (not initial.lookup_result_known or (
+                                initial.lookup_result_tokens <= 0 and entry.recovery_path is None)
                                 or active_branch != "waiting" or request.status not in (
                                     RequestStatus.WAITING, RequestStatus.PREEMPTED)
                                 or request.num_computed_tokens != 0):
@@ -2448,6 +2536,8 @@ class Scheduler(SchedulerInterface):
                     if sjf_order or compute_order:
                         break
                     observe_global(request, kind="compute", outcome="not_checked", reason="compute_selection_closed")
+                    plan_runtime.report_path(self, request, ResultKind.NOT_ATTEMPTED,
+                                             "compute_selection_closed")
                     continue
                 if active_branch == "running":
                     if request.status != RequestStatus.RUNNING or request not in self.running:
@@ -2459,6 +2549,9 @@ class Scheduler(SchedulerInterface):
                     else:
                         process_running(request)
                 elif waiting_closed or preempted_reqs:
+                    if explicit_plan:
+                        plan_runtime.report_path(self, request, ResultKind.NOT_ATTEMPTED,
+                                                 "waiting_admission_closed")
                     observe_global(request, outcome="not_checked", branch=active_branch, reason="waiting_admission_closed")
                 else:
                     if len(self.running) + self.num_waiting_for_streaming_input >= self.max_num_running_reqs:
