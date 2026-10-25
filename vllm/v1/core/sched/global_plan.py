@@ -223,7 +223,7 @@ class CandidateReader:
                 if rid in seen:
                     continue
                 seen.add(rid)
-                query = connector.lookup_operation_state(rid)
+                query = connector.lookup_operation_state(rid, request=request)
                 load = scheduler._action_loads.get(rid)
                 received = rid in scheduler.finished_recving_kv_req_ids
                 adopted = load is not None and load.result.value == "completion_adopted"

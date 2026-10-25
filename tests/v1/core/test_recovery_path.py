@@ -164,6 +164,103 @@ class RecoveryPathTests(unittest.TestCase):
     def tearDown(self):
         s.close_fixtures()
 
+    def test_failed_async_load_in_either_waiting_owner_is_not_published(self):
+        """Worker failure must truncate the reservation before native adoption."""
+        for owner in ("waiting", "skipped_waiting"):
+            for failure_policy in ("recompute", "fail", "cancel"):
+                with self.subTest(owner=owner, failure_policy=failure_policy):
+                    f = fixture()
+                    s.ops.prepare_full_output_fixture(f, runtime=RUNTIME)
+                    r, _ = matched(f, length=1677, local=32, lower=1280)
+                    r.sampling_params.num_logprobs = None
+                    f.scheduler.recompute_kv_load_failures = failure_policy != "fail"
+                    w = worker(f)
+                    w.adapter.kv_load_failure_policy = (
+                        "fail" if failure_policy == "fail" else "recompute"
+                    )
+                    choose(f, lambda v, f=f: (item(f, "q", "restore"),))
+                    reserved = f.scheduler.schedule()
+                    self.assertEqual(ranges(reserved, "RETRIEVE"), [(0, 1280)])
+                    self.assertEqual(reserved.num_scheduled_tokens, {})
+                    f.scheduler.update_from_output(
+                        reserved, w.active.no_forward(reserved)
+                    )
+                    if owner == "skipped_waiting":
+                        f.scheduler.waiting.remove_requests([r])
+                        f.scheduler.skipped_waiting.prepend_request(r)
+                    self.assertEqual(r.num_computed_tokens, 1280)
+                    self.assertGreater(w.adapter.page_ownership.pending_count, 0)
+                    choose(f, lambda v: ())
+                    pending = f.scheduler.schedule()
+                    f.scheduler.update_from_output(
+                        pending, w.active.no_forward(pending)
+                    )
+                    self.assertEqual(r.num_computed_tokens, 1280)
+                    if failure_policy == "cancel":
+                        f.scheduler.finish_requests("q", f.rt.status.FINISHED_ABORTED)
+                        self.assertTrue(
+                            f.scheduler.kv_cache_manager.get_block_ids("q")[0]
+                        )
+                        self.assertGreater(w.adapter.page_ownership.pending_count, 0)
+                    for future in w.adapter._fixture_futures:
+                        future.set_result(False)
+                    receipt = f.scheduler.schedule()
+                    result = w.active.no_forward(receipt)
+                    self.assertTrue(result.kv_connector_output.invalid_block_ids)
+                    f.scheduler.update_from_output(receipt, result)
+                    if failure_policy != "cancel":
+                        self.assertLessEqual(r.num_computed_tokens, 32)
+                    if failure_policy == "recompute":
+                        self.assertIn("q", f.scheduler.failed_recving_kv_req_ids)
+                        published = f.scheduler.schedule()
+                        self.assertEqual(published.num_scheduled_tokens, {})
+                        f.scheduler.update_from_output(
+                            published, w.active.no_forward(published)
+                        )
+                        self.assertEqual(r.status, f.rt.status.WAITING)
+                        self.assertLessEqual(r.num_computed_tokens, 32)
+                        f.scheduler.set_prefill_plan_policy(f.plan_types.NativePlan())
+                        out = f.scheduler.schedule()
+                        self.assertEqual(
+                            out.num_scheduled_tokens, {"q": 1645}, f.rt.events[-24:]
+                        )
+                        self.assertFalse(ranges(out, "RETRIEVE"))
+                        compute_output(f, w, r, out)
+                        self.assertEqual(r.num_output_tokens, 1)
+                        self.assertEqual(sum(c[0] == "LOOKUP" for c in f.rpc.calls), 1)
+                    elif failure_policy == "fail":
+                        self.assertEqual(r.status, f.rt.status.FINISHED_ERROR)
+                        self.assertEqual(r.num_output_tokens, 0)
+                    else:
+                        self.assertEqual(r.status, f.rt.status.FINISHED_ABORTED)
+                        self.assertEqual(r.num_output_tokens, 0)
+                    for _ in range(8):
+                        for future in w.adapter._fixture_futures:
+                            if not future.query():
+                                future.set_result(True)
+                        out = f.scheduler.schedule()
+                        self.assertEqual(out.num_scheduled_tokens, {})
+                        f.scheduler.update_from_output(out, w.active.no_forward(out))
+                        if (
+                            not f.scheduler.requests
+                            and not w.adapter.page_ownership.pending_count
+                        ):
+                            break
+                    self.assertFalse(f.scheduler.requests)
+                    self.assertEqual(w.adapter.page_ownership.pending_count, 0)
+                    self.assertEqual(
+                        f.scheduler.kv_cache_manager.get_block_ids("q"), ([],)
+                    )
+                    s.ops.wait_until(
+                        lambda f=f: f.adapter.cleanup_status()["pending"] == 0
+                    )
+                    self.assertEqual(
+                        f.rpc.clients[
+                            "server"
+                        ].server._ctx.session_manager.active_count(),
+                        0,
+                    )
+
     def test_production_observation_symbol_is_imported_before_method_use(self):
         source = (
             RUNTIME / "source/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py"

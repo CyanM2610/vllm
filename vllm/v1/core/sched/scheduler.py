@@ -4548,11 +4548,13 @@ class Scheduler(SchedulerInterface):
         should_fail = not self.recompute_kv_load_failures
 
         # handle async KV loads (not cached yet, evict_blocks=False)
-        async_load_reqs = (
-            req
-            for req in self.skipped_waiting
+        # Explicit LOAD admission retains the request in waiting; the native
+        # combined path moves it to skipped_waiting. Both own async targets.
+        async_load_reqs = {
+            req.request_id: req
+            for req in itertools.chain(self.skipped_waiting, self.waiting)
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
-        )
+        }.values()
         async_failed_req_ids, num_failed_tokens, _ = (
             self._update_requests_with_invalid_blocks(
                 async_load_reqs,
