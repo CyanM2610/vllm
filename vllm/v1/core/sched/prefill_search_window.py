@@ -73,7 +73,9 @@ class SearchBudget:
         self.next_read = self.started + 100_000
         self.granted_ms = self.allowance(self.window)
         self.deadline = self.started + int(self.granted_ms * 1e6)
+        self.initial_deadline = self.deadline
         self.cpu_deadline = self.cpu_started + int(config["absolute_cpu_ms"] * 1e6)
+        self.discard_reason = None
 
     def allowance(self, window):
         cfg = self.config
@@ -121,12 +123,22 @@ class SearchBudget:
     def with_reserve(self, reserve_ns):
         return BudgetSlice(self, reserve_ns)
 
-    def expired(self):
+    def completed_plan_discard_reason(self):
+        """Readiness stops search, not a complete plan within its original limit."""
         try:
             self.check()
-            return False
         except ScoreTimeout:
-            return True
+            pass
+        if self.config["budget_mode"] == "dynamic" and self.window.cancel_ready:
+            reason = "cancel_ready"
+        elif self.cpu() >= self.cpu_deadline:
+            reason = "cpu_limit"
+        elif self.clock() >= self.initial_deadline:
+            reason = "wall_limit"
+        else:
+            reason = None
+        self.discard_reason = reason
+        return reason
 
     def summary(self):
         return dict(
@@ -136,6 +148,8 @@ class SearchBudget:
             consumed_wall_ns=self.clock() - self.started,
             consumed_cpu_ns=self.cpu() - self.cpu_started,
             reason=self.reason,
+            completed_plan_discard_reason=self.discard_reason,
+            initial_allowed_ns=max(0, self.initial_deadline - self.started),
             checks=self.checks,
             readiness_reads=self.reads,
             shrinks=self.shrinks,

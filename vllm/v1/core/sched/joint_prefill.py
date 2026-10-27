@@ -383,6 +383,7 @@ class SRPTCoordinationPlan:
             accepted=[],
             rejected={},
             timed_out=False,
+            final_plan_fallback=None,
             prediction_invalid=None,
             baseline_wall_ns=baseline_ns,
             scope="conditional closed set; no GPU ranking guarantee",
@@ -400,12 +401,10 @@ class SRPTCoordinationPlan:
             else search_budget.with_reserve(reserve_ns)
         )
 
-        def expired():
-            return (
-                perf_counter_ns() >= hard_deadline
-                if search_budget is None
-                else search_budget.expired()
-            )
+        def completed_plan_discard_reason():
+            if search_budget is not None:
+                return search_budget.completed_plan_discard_reason()
+            return "wall_limit" if perf_counter_ns() >= hard_deadline else None
 
         score_wall = score_cpu = generate_wall = generate_cpu = select_wall = (
             select_cpu
@@ -571,15 +570,19 @@ class SRPTCoordinationPlan:
             report["baseline_uncovered"] = str(e)
             chosen = baseline_spec
         result = self.build(snapshot, chosen)
-        if searching and expired():
-            report["timed_out"] = True
+        discard = completed_plan_discard_reason() if searching else None
+        if discard is not None:
+            report["final_plan_fallback"] = discard
+            report["timed_out"] = discard != "cancel_ready"
             chosen = baseline_spec
             result = baseline
         self.rotation += 1
         self.current = chosen
         self.predicted = self.expected_grants(snapshot, chosen)
-        if searching and expired():
-            report["timed_out"] = True
+        discard = completed_plan_discard_reason() if searching else None
+        if discard is not None:
+            report["final_plan_fallback"] = discard
+            report["timed_out"] = discard != "cancel_ready"
             chosen = baseline_spec
             result = baseline
             self.current = chosen

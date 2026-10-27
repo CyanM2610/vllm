@@ -106,6 +106,116 @@ class RollingTests(unittest.TestCase):
             budget.check()
         self.assertEqual(budget.reason, "result_ready")
 
+    def ready_candidate(self, point="score", event="result", complete=True):
+        """Actual eight-scene scoring, then native allocation under a host signal."""
+        f = base.fixture()
+        p = install(f, mode="dynamic")
+        p.scenes = tuple(dict(p.scenes[0], name=f"case-{i}") for i in range(8))
+        p.config["scenarios"] = list(p.scenes)
+        p.limit = 1  # Isolate the first complete candidate at each final guard.
+        for rid, length in (("a", 512), ("b", 512), ("long", 4000)):
+            base.rt.matched(f, rid=rid, length=length, local=0, lower=0)
+        state = dict(ready=False, wall=0, cpu=0, scored=0)
+        p.set_execution_window_reader(
+            lambda: p.window_type(
+                result_ready=state["ready"] and event != "control",
+                control_ready=state["ready"] and event == "control",
+                cancel_ready=state["ready"] and event == "cancel",
+            )
+        )
+        cls = p.new_budget.__globals__["SearchBudget"]
+        p.new_budget = lambda: cls(
+            p.rolling_config,
+            p.window_reader,
+            clock=lambda: state["wall"],
+            cpu=lambda: state["cpu"],
+        )
+
+        def signal():
+            state.update(ready=True, wall=100_001)
+            if event == "wall":
+                state["wall"] = 2_000_001
+            elif event == "cpu":
+                state["cpu"] = 8_000_001
+
+        score, build, grants = p.scorer.score, p.build, p.expected_grants
+
+        def scored(*args, **kwargs):
+            result = score(*args, **kwargs)
+            if args[1].end_after == "a":
+                state["scored"] += 1
+                if point == "score" and state["scored"] == (8 if complete else 4):
+                    signal()
+            return result
+
+        def built(snapshot, spec):
+            result = build(snapshot, spec)
+            if point == "build" and spec.end_after == "a":
+                signal()
+            return result
+
+        def predicted(snapshot, spec):
+            result = grants(snapshot, spec)
+            if point == "predicted" and spec.end_after == "a":
+                signal()
+            return result
+
+        with (
+            patch.object(p.scorer, "score", scored),
+            patch.object(p, "build", built),
+            patch.object(p, "expected_grants", predicted),
+        ):
+            out = f.scheduler.schedule()
+        keep = complete and event in ("result", "control")
+        expected = {"a": 512} if keep else {"a": 512, "b": 512, "long": 1024}
+        self.assertEqual(out.num_scheduled_tokens, expected)
+        self.assertEqual(p.last_report["effective_change"], keep)
+        self.assertEqual(p.current.end_after, "a" if keep else None)
+        self.assertEqual(p.predicted, {rid: (0, q) for rid, q in expected.items()})
+        self.assertIsNotNone(out.kv_connector_metadata)
+        self.assertEqual(p.last_report["fully_scored_candidates"], int(complete))
+        if keep:
+            self.assertFalse(p.last_report["timed_out"])
+            self.assertIsNone(p.last_report["final_plan_fallback"])
+        elif complete:
+            self.assertEqual(
+                p.last_report["final_plan_fallback"],
+                {"wall": "wall_limit", "cpu": "cpu_limit", "cancel": "cancel_ready"}[
+                    event
+                ],
+            )
+        WITNESSES.append(
+            dict(
+                name="ready_candidate",
+                point=point,
+                event=event,
+                complete=complete,
+                grants=dict(out.num_scheduled_tokens),
+                decision=p.last_report,
+                budget=p.rolling_report["budget"],
+            )
+        )
+
+    def test_ready_after_complete_scoring_keeps_actual_selected_quota(self):
+        self.ready_candidate()
+
+    def test_ready_during_plan_materialization_keeps_complete_candidate(self):
+        self.ready_candidate(point="build")
+
+    def test_ready_after_expected_grants_keeps_complete_candidate(self):
+        self.ready_candidate(point="predicted")
+
+    def test_control_reply_ready_keeps_complete_candidate(self):
+        self.ready_candidate(event="control")
+
+    def test_ready_discards_half_evaluated_candidate(self):
+        self.ready_candidate(complete=False)
+
+    def test_hard_limits_and_cancellation_still_discard_complete_candidate(self):
+        for event in ("wall", "cpu", "cancel"):
+            with self.subTest(event=event):
+                self.ready_candidate(event=event)
+
     def test_tail_rolls_once_then_expired_generation_cannot_renew(self):
         f = base.fixture()
         p = install(f)
@@ -423,6 +533,6 @@ class RollingTests(unittest.TestCase):
         clock[0] = 7_900_000
         with self.assertRaises(p.timeout_type):
             budget.check(200_000)
-        self.assertFalse(budget.expired())
+        self.assertIsNone(budget.completed_plan_discard_reason())
         clock[0] = 8_000_000
-        self.assertTrue(budget.expired())
+        self.assertEqual(budget.completed_plan_discard_reason(), "wall_limit")
