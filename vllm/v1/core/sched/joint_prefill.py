@@ -344,7 +344,7 @@ class SRPTCoordinationPlan:
                     )
                 )
 
-    def plan(self, snapshot):
+    def plan(self, snapshot, *, allow_search=True, search_budget=None):
         wall, cpu = perf_counter_ns(), thread_time_ns()
         self.snapshot = snapshot
         self.invalid = None
@@ -377,6 +377,7 @@ class SRPTCoordinationPlan:
             requests_covered=0,
             scores=0,
             scenario_scores=0,
+            fully_scored_candidates=0,
             candidate_kinds={},
             rounds=0,
             accepted=[],
@@ -387,11 +388,25 @@ class SRPTCoordinationPlan:
             scope="conditional closed set; no GPU ranking guarantee",
         )
         started = perf_counter_ns()
-        hard_deadline = started + int(self.time_ms * 1e6)
+        time_ms = self.time_ms if search_budget is None else search_budget.granted_ms
+        searching = self.enabled and allow_search and time_ms > 0
+        hard_deadline = started + int(time_ms * 1e6)
         # Bound the expensive evaluator while reserving measured full-queue
         # work for materializing the already validated fallback/final plan.
         reserve_ns = max(250_000, 4 * baseline_ns)
-        deadline = hard_deadline - reserve_ns
+        deadline = (
+            hard_deadline - reserve_ns
+            if search_budget is None
+            else search_budget.with_reserve(reserve_ns)
+        )
+
+        def expired():
+            return (
+                perf_counter_ns() >= hard_deadline
+                if search_budget is None
+                else search_budget.expired()
+            )
+
         score_wall = score_cpu = generate_wall = generate_cpu = select_wall = (
             select_cpu
         ) = 0
@@ -419,9 +434,11 @@ class SRPTCoordinationPlan:
                         )
                         report["scenario_scores"] += 1
                     value = self.scorer.score(
-                        snapshot, spec, features, scene, self.time_ms, deadline
+                        snapshot, spec, features, scene, time_ms, deadline
                     )
                     report["scenario_scores"] += 1
+                    if i == len(self.scenes) - 1:
+                        report["fully_scored_candidates"] += 1
                     limit = (
                         baseline_cache[i].objective
                         if incumbent is None
@@ -444,7 +461,7 @@ class SRPTCoordinationPlan:
         best = None
         best_scores = None
         try:
-            if self.enabled:
+            if searching:
                 w, c = perf_counter_ns(), thread_time_ns()
                 groups, overlap = self.groups(snapshot, deadline)
                 generate_wall += perf_counter_ns() - w
@@ -554,14 +571,14 @@ class SRPTCoordinationPlan:
             report["baseline_uncovered"] = str(e)
             chosen = baseline_spec
         result = self.build(snapshot, chosen)
-        if self.enabled and perf_counter_ns() >= hard_deadline:
+        if searching and expired():
             report["timed_out"] = True
             chosen = baseline_spec
             result = baseline
         self.rotation += 1
         self.current = chosen
         self.predicted = self.expected_grants(snapshot, chosen)
-        if self.enabled and perf_counter_ns() >= hard_deadline:
+        if searching and expired():
             report["timed_out"] = True
             chosen = baseline_spec
             result = baseline
@@ -583,7 +600,7 @@ class SRPTCoordinationPlan:
             selection_thread_cpu_ns=select_cpu,
             total_wall_ns=perf_counter_ns() - wall,
             total_thread_cpu_ns=thread_time_ns() - cpu,
-            charged_candidate_delay_ms=self.time_ms if self.enabled else 0.0,
+            charged_candidate_delay_ms=time_ms if searching else 0.0,
             finalization_reserve_ns=reserve_ns,
             measured_extra_wall_ns=perf_counter_ns() - started,
         )
