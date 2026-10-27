@@ -355,6 +355,7 @@ class PlanRuntime(CandidateReader):
 
     def begin(self, scheduler, token_budget, input_budget):
         # Retirement is outside the pure reader and does not hold Request refs.
+        self.policy_callback = scheduler._action_feedback._callback
         wall, cpu = perf_counter_ns(), thread_time_ns()
         snapshot = self.read_snapshot(scheduler, token_budget, input_budget)
         snapshot_time = (perf_counter_ns()-wall, thread_time_ns()-cpu)
@@ -569,12 +570,17 @@ class PlanRuntime(CandidateReader):
                      scope="native attempt including nested checks; not additive to scheduler time")
 
     def final_stats(self, output):
+        shape = ()
         if output.num_scheduled_tokens:
             shape = tuple((rid, *self.current_grants[rid]) for rid in output.num_scheduled_tokens
                           if rid in self.current_grants)
             if len(shape) == len(output.num_scheduled_tokens):
                 self.pending_batches[self.snapshot.step_id] = SubmittedBatch(
                     self.snapshot.step_id, shape, monotonic_ns())
+        committed = getattr(self.policy, "on_step_committed", None)
+        if committed is not None:
+            self.policy_callback(committed, self.snapshot.step_id, shape,
+                                 len(shape) == len(output.num_scheduled_tokens))
         self.worker_initialized.update(r.req_id for r in output.scheduled_new_reqs)
         self.worker_initialized.difference_update(output.finished_req_ids)
         self.timings[-1].update(checked_requests=len(self.checked), actual_checks=self.check_count,

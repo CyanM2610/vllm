@@ -241,6 +241,13 @@ class EngineCore:
 
         self.aborts_queue = queue.Queue[list[str]]()
 
+        window_reader = getattr(self.scheduler, "set_execution_window_reader", None)
+        if window_reader is not None:
+            from vllm.v1.core.sched.prefill_search_window import read_engine_window
+            window_reader(lambda: read_engine_window(
+                self.batch_queue, not self.aborts_queue.empty()
+            ))
+
         self._idle_state_callbacks: list[Callable] = []
 
         # Mark the startup heap as static so that it's ignored by GC.
@@ -608,6 +615,8 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        if hasattr(self.scheduler, "set_execution_window_reader"):
+            scheduler_output._coord_host_submit_ns = time.monotonic_ns()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -666,6 +675,9 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            if hasattr(self.scheduler, "set_execution_window_reader"):
+                # Host submission evidence only, NEVER a device start timestamp.
+                scheduler_output._coord_host_submit_ns = time.monotonic_ns()
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True

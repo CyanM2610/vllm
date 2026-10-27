@@ -291,6 +291,10 @@ def nans_to_dict(counts: list[int], req_id_to_index: dict[str, int]) -> dict[str
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
+    def peek_ready(self) -> bool:
+        """Read the existing sample-copy event; no wait, release or new event."""
+        return self.async_copy_ready_event.query()
+
     def __init__(
         self,
         model_runner_output: ModelRunnerOutput,

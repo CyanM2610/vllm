@@ -426,6 +426,10 @@ class ModelRunnerOutput:
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):
+    def peek_ready(self) -> bool | None:
+        """Non-consuming readiness, or unknown for an unsupported output wrapper."""
+        return None
+
     @abstractmethod
     def get_output(self) -> ModelRunnerOutput:
         """Get the ModelRunnerOutput for this async output.

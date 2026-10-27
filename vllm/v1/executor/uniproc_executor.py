@@ -37,6 +37,11 @@ class AsyncOutputFuture(Future):
         self.single_value = single_value
         super().__init__()
 
+    def peek_ready(self) -> bool | None:
+        # done() alone stays false until result() consumes get_output().
+        # Do not consume outputs or promote this Future's state here.
+        return True if super().done() else self.async_output.peek_ready()
+
     def result(self, timeout=None):
         if timeout is not None:
             raise RuntimeError("timeout not implemented")
