@@ -3,6 +3,7 @@
 
 from dataclasses import asdict, dataclass
 from time import perf_counter_ns, thread_time_ns
+from weakref import ref
 
 from vllm.v1.core.sched.joint_prefill_score import ScoreTimeout
 
@@ -44,6 +45,19 @@ def read_engine_window(batch_queue, cancel_ready=False):
     return ExecutionWindow(
         queued, any(q.result_ready is True for q in queued), cancel_ready=cancel_ready
     )
+
+
+def engine_window_reader(engine):
+    """The policy reader must not prolong EngineCore/executor/IPC ownership."""
+    owner = ref(engine)
+
+    def read():
+        core = owner()
+        if core is None:
+            return ExecutionWindow()
+        return read_engine_window(core.batch_queue, not core.aborts_queue.empty())
+
+    return read
 
 
 class SearchBudget:

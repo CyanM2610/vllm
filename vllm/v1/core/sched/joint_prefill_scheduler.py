@@ -55,12 +55,17 @@ class SRPTRollingScheduler(SRPTCoordinationScheduler):
 
     def set_execution_window_reader(self, reader):
         from dataclasses import replace
+        from weakref import ref
 
         policy = self._global_plan.policy
+        policy_ref, connector_ref = ref(policy), ref(self.connector)
 
         def read():
             window = reader()
-            snapshot = policy.snapshot
+            current, connector = policy_ref(), connector_ref()
+            if current is None or connector is None:
+                return window
+            snapshot = current.snapshot
             requests = (
                 ()
                 if snapshot is None
@@ -71,7 +76,7 @@ class SRPTRollingScheduler(SRPTCoordinationScheduler):
                 )
             )
             # Bounded read of host future flags, no result consumption or STATUS.
-            readiness = self.connector.lookup_reply_readiness(requests[:32])
+            readiness = connector.lookup_reply_readiness(requests[:32])
             return replace(
                 window,
                 control_ready=readiness["ready"],

@@ -242,6 +242,28 @@ class RollingTests(unittest.TestCase):
         self.assertIsNone(view.device_remaining_lower_ms)
         self.assertEqual(tuple(queue), original)
 
+    def test_readiness_reader_does_not_keep_engine_owner_alive(self):
+        import gc
+        import queue
+        import weakref
+
+        f = base.fixture()
+        p = install(f)
+        module = __import__(p.window_type.__module__, fromlist=["engine_window_reader"])
+
+        class Owner:
+            batch_queue = None
+            aborts_queue = queue.Queue()
+
+        owner = Owner()
+        observed = weakref.ref(owner)
+        reader = module.engine_window_reader(owner)
+        p.set_execution_window_reader(reader)
+        del owner
+        gc.collect()
+        self.assertIsNone(observed())
+        self.assertEqual(reader(), p.window_type())
+
     def test_actual_async_future_peeks_existing_event_without_consuming_output(self):
         import ast
         from concurrent.futures import Future

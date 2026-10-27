@@ -243,10 +243,8 @@ class EngineCore:
 
         window_reader = getattr(self.scheduler, "set_execution_window_reader", None)
         if window_reader is not None:
-            from vllm.v1.core.sched.prefill_search_window import read_engine_window
-            window_reader(lambda: read_engine_window(
-                self.batch_queue, not self.aborts_queue.empty()
-            ))
+            from vllm.v1.core.sched.prefill_search_window import engine_window_reader
+            window_reader(engine_window_reader(self))
 
         self._idle_state_callbacks: list[Callable] = []
 
