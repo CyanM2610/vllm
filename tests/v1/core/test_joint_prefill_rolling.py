@@ -42,6 +42,21 @@ def install(f, enabled=True, mode="fixed"):
 
 
 class RollingTests(unittest.TestCase):
+    def test_v2_output_reads_existing_copy_event_without_consumption(self):
+        from types import SimpleNamespace
+
+        class Output:
+            def get_output(self):
+                raise AssertionError("readiness must not consume output")
+
+        source = base.rt.RUNTIME / "source/vllm/vllm/v1/worker/gpu/async_utils.py"
+        base.s.ops.add_methods(source, "AsyncOutput", Output, {"peek_ready"}, {})
+        calls = []
+        output = Output()
+        output.copy_event = SimpleNamespace(query=lambda: calls.append(True) or True)
+        self.assertTrue(output.peek_ready())
+        self.assertEqual(calls, [True])
+
     def tearDown(self):
         base.s.close_fixtures()
 

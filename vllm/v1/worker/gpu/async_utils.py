@@ -114,6 +114,10 @@ class StepTimingCollector:
 
 
 class AsyncOutput(AsyncModelRunnerOutput):
+    def peek_ready(self) -> bool:
+        """Read existing V2 output-copy completion without consuming the output."""
+        return self.copy_event.query()
+
     def __init__(
         self,
         model_runner_output: ModelRunnerOutput,
