@@ -81,6 +81,123 @@ class TieredTests(unittest.TestCase):
     def tearDown(self):
         base.s.close_fixtures()
 
+    def test_shaped_window_uses_host_forward_as_lower_start_not_device_time(self):
+        from vllm.v1.core.sched.prefill_search_window import QueuedExecution
+
+        f = base.fixture()
+        p = install(f, False)
+        base.rt.matched(f, rid="long", length=6000, local=0, lower=0)
+        f.scheduler.schedule()
+        snap = f.scheduler.get_prefill_candidate_snapshot()
+        item = snap.submitted_batches[0]
+        p.window_model.config = dict(
+            schema="A100-shaped-window-r2",
+            admitted=True,
+            bins=[dict(q_min=1, q_max=2048, covered=True, lower_scale=0.8)],
+        )
+        queue = QueuedExecution(
+            item.step_id,
+            1_000_000_000,
+            False,
+            True,
+            forward_host_start_ns=1_040_000_000,
+        )
+        window = p.window_type(queued=(queue,))
+        end, basis = p.window_model.bound(snap, window, 1_050_000_000)
+        service = p.scorer.gpu(item.shape, {"gpu_scale": 1}) * 0.8
+        self.assertEqual(end, 1_040_000_000 + int(service * 1e6))
+        self.assertEqual(basis, "host_forward_lower_start_shaped_service")
+        self.assertEqual(queue.device_progress, "unknown")
+        missing = replace(window, queued=(replace(queue, forward_host_start_ns=None),))
+        earlier, _ = p.window_model.bound(snap, missing, 1_050_000_000)
+        self.assertEqual(end - earlier, 40_000_000)
+        future = replace(
+            window, queued=(replace(queue, forward_host_start_ns=2_000_000_000),)
+        )
+        self.assertEqual(p.window_model.bound(snap, future, 1_050_000_000)[0], earlier)
+        done = replace(window, queued=(replace(queue, result_ready=True),))
+        self.assertEqual(
+            p.window_model.bound(snap, done, 1_050_000_000)[0], 1_050_000_000
+        )
+
+    def test_native_window_reads_host_boundary_without_consuming_future(self):
+        from collections import deque
+        from types import SimpleNamespace as NS
+
+        from vllm.v1.core.sched.prefill_search_window import read_engine_window
+
+        f = base.fixture()
+        install(f, False)
+        base.rt.matched(f, rid="a", length=3000, local=0, lower=0)
+        out = f.scheduler.schedule()
+        out._coord_host_submit_ns = 100
+        out._coord_forward_host_start_ns = 130
+        calls = []
+        future = NS(
+            peek_ready=lambda: calls.append("peek") or False,
+            result=lambda: (_ for _ in ()).throw(AssertionError("consume")),
+        )
+        view = read_engine_window(deque([(future, out, NS(done=lambda: True))]))
+        self.assertEqual(calls, ["peek"])
+        self.assertEqual(view.queued[0].host_submitted_ns, 100)
+        self.assertEqual(view.queued[0].forward_host_start_ns, 130)
+        self.assertEqual(view.queued[0].device_progress, "unknown")
+
+    def test_sixteen_ms_budget_keeps_reserves_and_never_extends(self):
+        f = base.fixture()
+        p = install(f, False)
+        base.rt.matched(f, rid="long", length=6000, local=0, lower=0)
+        f.scheduler.schedule()
+        snap = f.scheduler.get_prefill_candidate_snapshot()
+        from vllm.v1.core.sched.prefill_search_window import QueuedExecution
+
+        cfg = dict(
+            p.tiered_config,
+            wall_limit_ms=16,
+            cpu_limit_ms=16,
+            control_limit_ms=16,
+            submit_reserve_ms=3,
+        )
+        p.window_model.config = dict(
+            schema="A100-shaped-window-r2",
+            admitted=True,
+            bins=[dict(q_min=1, q_max=2048, covered=True, lower_scale=0.8)],
+        )
+        state = dict(now=0, control=False)
+        read = lambda: p.window_type(
+            queued=(
+                QueuedExecution(
+                    snap.submitted_batches[0].step_id,
+                    0,
+                    False,
+                    True,
+                    forward_host_start_ns=0,
+                ),
+            ),
+            control_ready=state["control"],
+        )
+        Budget = p.new_budget.__globals__["TieredBudget"]
+        b = Budget(
+            cfg,
+            snap,
+            read,
+            p.window_model,
+            clock=lambda: state["now"],
+            cpu=lambda: state["now"],
+            host_clock=lambda: state["now"],
+        )
+        self.assertEqual(b.summary()["granted_ms"], 16)
+        original = b.deadline
+        state["now"] = 1_000_000
+        b.check()
+        self.assertLessEqual(b.deadline, original)
+        state.update(now=2_000_000, control=True)
+        with self.assertRaisesRegex(Exception, "control_ready"):
+            b.slice(1).check()
+        self.assertIsNone(b.completed_plan_discard_reason())
+        state["now"] = 16_000_001
+        self.assertEqual(b.completed_plan_discard_reason(), "cpu_limit")
+
     def test_disabled_is_common_srpt_and_no_new_control_operation(self):
         outputs = []
         for version in (1, 3):
@@ -286,7 +403,9 @@ class TieredTests(unittest.TestCase):
         with patch.object(base, "install", create):
             base.JointPrefillTests().test_shared_candidate_waits_only_after_real_reservation_then_rematches()
         WITNESSES.extend(
-            x for x in base.WITNESSES if x.get("name") == "shared_restore_actual_lifetime"
+            x
+            for x in base.WITNESSES
+            if x.get("name") == "shared_restore_actual_lifetime"
         )
 
     def test_completed_incumbent_survives_ready_but_partial_candidate_cannot_replace_it(

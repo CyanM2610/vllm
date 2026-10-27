@@ -15,6 +15,9 @@ class QueuedExecution:
     result_ready: bool | None
     execution_reply_ready: bool
     device_progress: str = "unknown"
+    # Host entry to the actual eager model call; a lower bound on device start.
+    # This is not a CUDA timestamp and carries no device progress claim.
+    forward_host_start_ns: int | None = None
 
 
 @dataclass(frozen=True)
@@ -39,6 +42,7 @@ def read_engine_window(batch_queue, cancel_ready=False):
             getattr(output, "_coord_host_submit_ns", None),
             future.peek_ready() if hasattr(future, "peek_ready") else future.done(),
             execution.done(),
+            forward_host_start_ns=getattr(output, "_coord_forward_host_start_ns", None),
         )
         for future, output, execution in reversed(batch_queue or ())
     )

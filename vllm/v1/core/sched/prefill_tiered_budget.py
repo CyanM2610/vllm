@@ -27,10 +27,27 @@ class GPUWindow:
             duration = self.scorer.gpu(shape, {"gpu_scale": 1.0})
         except ScoreUnknown:
             return None, "shape_outside_model"
-        duration *= cfg["lower_scale"]
+        start = submitted
+        basis = "validated_host_plus_lower_service"
+        if cfg.get("schema") == "A100-shaped-window-r2":
+            q = sum(tokens for _, _, tokens in shape)
+            group = next(
+                (b for b in cfg["bins"] if b["q_min"] <= q <= b["q_max"]), None
+            )
+            if group is None or not group["covered"]:
+                return None, "shape_bin_uncovered"
+            duration *= group["lower_scale"]
+            forward = oldest.forward_host_start_ns
+            if forward is not None and submitted <= forward <= now_ns:
+                start = forward
+                basis = "host_forward_lower_start_shaped_service"
+            else:
+                basis = "host_submit_fallback_shaped_service"
+        else:
+            duration *= cfg["lower_scale"]
         # Device start cannot precede native execute_model submission. A lower
         # service duration therefore gives a conditional lower completion bound.
-        return submitted + int(duration * 1e6), "validated_host_plus_lower_service"
+        return start + int(duration * 1e6), basis
 
 
 class TieredBudget:
@@ -58,6 +75,7 @@ class TieredBudget:
         self.window = reader()
         self.reads += 1
         now, host_now = clock(), host_clock()
+        self.observation_ns = host_now
         bound, self.basis = model.bound(snapshot, self.window, host_now)
         if bound is None:
             available = config["unknown_window_ms"]
@@ -78,6 +96,7 @@ class TieredBudget:
         self.cpu_deadline = self.cpu_started + int(config["cpu_limit_ms"] * 1e6)
         self.next_read = now + 100_000
         self.initial_window_ms = max(0.0, (bound - host_now) / 1e6) if bound else None
+        self.initial_queue = tuple(self.window.queued)
 
     def ready(self):
         return (
@@ -149,6 +168,7 @@ class TieredBudget:
     def summary(self):
         return dict(
             granted_ms=max(0, self.initial_deadline - self.started) / 1e6,
+            observation_ns=self.observation_ns,
             remaining_ms=self.remaining_ns() / 1e6,
             consumed_wall_ns=self.clock() - self.started,
             consumed_cpu_ns=self.cpu() - self.cpu_started,
@@ -161,6 +181,16 @@ class TieredBudget:
             initial_gpu_window_ms=self.initial_window_ms,
             result_ready=self.window.result_ready,
             control_ready=self.window.control_ready,
+            queued_executions=[
+                dict(
+                    step_id=q.step_id,
+                    host_submitted_ns=q.host_submitted_ns,
+                    forward_host_start_ns=q.forward_host_start_ns,
+                    result_ready=q.result_ready,
+                    device_progress=q.device_progress,
+                )
+                for q in self.initial_queue
+            ],
         )
 
 

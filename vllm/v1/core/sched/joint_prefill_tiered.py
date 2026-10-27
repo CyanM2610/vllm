@@ -42,8 +42,11 @@ class SRPTTieredPlan(SRPTCoordinationPlan):
             raise ValueError(
                 "V3 requires <=32 bounded proposals and eight source scenarios"
             )
+        ceiling = (
+            16 if cfg["gpu_window"].get("schema") == "A100-shaped-window-r2" else 8
+        )
         if any(
-            not 0 < cfg[k] <= 8
+            not 0 < cfg[k] <= ceiling
             for k in (
                 "wall_limit_ms",
                 "cpu_limit_ms",
@@ -52,7 +55,7 @@ class SRPTTieredPlan(SRPTCoordinationPlan):
                 "submit_reserve_ms",
             )
         ):
-            raise ValueError("V3 permits at most 8ms wall/CPU/control delay")
+            raise ValueError(f"V3 permits at most {ceiling}ms wall/CPU/control delay")
         self.reference = self.scorer
         self.scorer = ShapeCachedScorer(self.config["costs"], self.order)
         self.window_model = GPUWindow(cfg["gpu_window"], self.scorer)

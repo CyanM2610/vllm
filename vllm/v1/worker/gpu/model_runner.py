@@ -1782,7 +1782,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         wait_once("first_compute_launch", wait_rid)
                     with wait_span("model_forward", ",".join(input_batch.req_ids),
                                    request_ids=input_batch.req_ids):
-                        with wait_span("batch_forward", current_batch(), batch_id=current_batch()):
+                        # UniProc shares this output object with EngineCore. The
+                        # scalar marks host enqueue entry, never device start.
+                        scheduler_output._coord_forward_host_start_ns = (
+                            time.monotonic_ns()
+                        )
+                        with wait_span(
+                            "batch_forward", current_batch(),
+                            batch_id=current_batch(),
+                            forward_host_start_ns=(
+                                scheduler_output._coord_forward_host_start_ns
+                            ),
+                        ):
                             model_output = self.model(**model_inputs)
 
         if self.is_last_pp_rank:
