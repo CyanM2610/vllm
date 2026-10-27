@@ -85,3 +85,14 @@ class SRPTRollingScheduler(SRPTCoordinationScheduler):
             )
 
         policy.set_execution_window_reader(read)
+
+
+class SRPTTieredScheduler(SRPTRollingScheduler):
+    schema = "srpt-coordination-v3"
+
+    def make_policy(self, config):
+        from vllm.v1.core.sched.joint_prefill_tiered import SRPTTieredPlan
+
+        if not config["tiered"]["cpu_cost"].get("admitted"):
+            raise ValueError("V3 requires a frozen CPU cost calibration")
+        return SRPTTieredPlan(self.vllm_config.model_config.hf_config, config)
