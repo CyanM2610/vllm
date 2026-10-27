@@ -24,6 +24,21 @@ class MatchObservation:
 
 
 @dataclass(frozen=True)
+class LogicalPrefix:
+    namespace: tuple[str, ...]
+    # Existing chained input hashes at complete 256-token boundaries.
+    boundaries: tuple[tuple[int, str], ...]
+
+
+@dataclass(frozen=True)
+class SubmittedBatch:
+    step_id: int
+    shape: tuple[tuple[str, int, int], ...]
+    observed_ns: int
+    device_progress: str = "unknown"
+
+
+@dataclass(frozen=True)
 class RequestCandidate:
     request_id: str
     enqueue_sequence: int
@@ -51,6 +66,8 @@ class RequestCandidate:
     restore_failed: bool = False
     first_match: FirstMatch | None = None
     committed_recovery_path: str | None = None
+    logical_prefix: LogicalPrefix | None = None
+    store_committed_or_saved_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +113,7 @@ class CandidateSnapshot:
     omitted_requests: int = 0
     physical_completion_scope: str = "only native received/adopted evidence; no device polling"
     recovery_path_choice_enabled: bool = False
+    submitted_batches: tuple[SubmittedBatch, ...] = ()
 
 
 class OperationKind(str, Enum):
@@ -135,6 +153,7 @@ class PlanItem:
     max_tokens: int | None = None
     end_after_commit: bool = False
     recovery_path: RecoveryPath | None = None
+    defer_while_loading: str | None = None
 
 
 @dataclass(frozen=True)
@@ -197,6 +216,28 @@ def _operation(view, retained=False, sequence=None):
     )
 
 
+def logical_prefix(request, scheduler):
+    """Copy existing input identity only, scoped to this model/salt/layout."""
+    cfg = scheduler.vllm_config
+    model = getattr(cfg.model_config, "model", None)
+    cache = cfg.cache_config
+    hashes = getattr(request, "block_hashes", ())
+    if model is None or getattr(cache, "block_size", None) != 16:
+        return None
+    # The global-plan constructor already restricts to a single full-attention
+    # group. Never calculate new hashes or inspect the cache directory here.
+    if not all(isinstance(h, bytes) for h in hashes):
+        return None
+    layout = getattr(scheduler.kv_cache_config, "kv_cache_layout", None)
+    if layout is None:
+        return None
+    namespace = (str(model), str(getattr(cfg.model_config, "dtype", "unknown")),
+                 str(layout), str(getattr(cache, "prefix_caching_hash_algo", "unknown")),
+                 "block16/chunk256", str(getattr(request, "cache_salt", None)))
+    return LogicalPrefix(namespace, tuple(((i+1)*16, hashes[i].hex())
+                                         for i in range(15, len(hashes), 16)))
+
+
 class CandidateReader:
     """Pure scalar snapshot shared by operation plans and compute-only policies."""
     def __init__(self):
@@ -252,6 +293,8 @@ class CandidateReader:
                     (scheduler._first_match_preparation.first.get(rid)
                      if getattr(scheduler, "_first_match_preparation", None) else None),
                     getattr(self, "path_commits", {}).get(rid),
+                    logical_prefix(request, scheduler),
+                    query.get("store_committed_or_saved_tokens"),
                 ))
         operations = [_operation(v, bool(v.get("retained_store")), self.sequences.get(v["request_id"]))
                       for v in connector.get_global_operation_snapshot()]
@@ -276,6 +319,7 @@ class CandidateReader:
             bool(connector.decoupled_store_enabled),
             self.new_lookup, self.lookup_limit, self.load_limit,
             recovery_path_choice_enabled=getattr(self, "recovery_path_choice", False),
+            submitted_batches=tuple(getattr(self, "pending_batches", {}).values()),
         )
 
 
@@ -306,6 +350,8 @@ class PlanRuntime(CandidateReader):
         # Commitment observations only: no resources, Request refs or block IDs.
         self.path_commits = {}
         self.path_feedback = deque(maxlen=128)
+        self.pending_batches = {}
+        self.current_grants = {}
 
     def begin(self, scheduler, token_budget, input_budget):
         # Retirement is outside the pure reader and does not hold Request refs.
@@ -331,6 +377,7 @@ class PlanRuntime(CandidateReader):
         self.snapshot = snapshot
         self.checked = set()
         self.check_count = self.check_cpu_ns = self.check_wall_ns = 0
+        self.current_grants = {}
         self.lookup_attempted = self.lookup_submitted = self.load_attempted = 0
         self.native_wall_ns = self.native_cpu_ns = 0
         self.dispatch_wall_ns = self.dispatch_cpu_ns = 0
@@ -383,6 +430,11 @@ class PlanRuntime(CandidateReader):
                 raise ValueError("positive token cap only applies to COMPUTE")
             if item.end_after_commit and item.kind != OperationKind.COMPUTE:
                 raise ValueError("end_after_commit only applies to COMPUTE")
+            if item.defer_while_loading is not None and (
+                    item.defer_while_loading not in request_ids
+                    or item.defer_while_loading == item.request_id
+                    or item.kind == OperationKind.LOOKUP):
+                raise ValueError("restore dependency requires a different visible owner")
             if item.recovery_path is not None:
                 if not snapshot.recovery_path_choice_enabled:
                     raise ValueError("explicit recovery paths require recovery_path_choice=true")
@@ -423,17 +475,54 @@ class PlanRuntime(CandidateReader):
             item = self.active_item
             if item is None or item.request_id != candidate.request_id or item.kind.value != candidate.kind:
                 raise RuntimeError("native operation lacks the current plan authorization")
-            return OperationAction(compute_tokens=min(item.max_tokens, candidate.proposed_tokens)
+            action = OperationAction(compute_tokens=min(item.max_tokens, candidate.proposed_tokens)
                                    if item.max_tokens is not None else None,
                                    end_after_commit=item.end_after_commit)
+            callback = getattr(self.policy, "check_compute_proposal", None)
+            return callback(candidate, action) if callback and candidate.kind == "compute" else action
         finally:
             self.check_wall_ns += perf_counter_ns()-started
             self.check_cpu_ns += thread_time_ns()-cpu
 
     def on_feedback(self, result):
+        if result.kind == "compute" and self.snapshot is not None and result.step_id == self.snapshot.step_id:
+            if result.result == ResultKind.SELECTED:
+                self.current_grants[result.request_id] = (result.start_token, result.granted_tokens)
+            elif result.result == ResultKind.REVOKED:
+                self.current_grants.pop(result.request_id, None)
         callback = getattr(self.policy, "on_feedback", None)
         if callback is not None:
             callback(result)
+
+    def prepare_attempt(self, scheduler, item):
+        """Only a currently reserved native LOAD establishes a wait dependency."""
+        callback = getattr(self.policy, "revise_attempt", None)
+        revised = callback(item) if callback else item
+        if (not isinstance(revised, PlanItem)
+                or (revised.kind, revised.request_id) != (item.kind, item.request_id)
+                or revised.recovery_path not in (None, item.recovery_path)
+                or revised.defer_while_loading not in (None, item.defer_while_loading)
+                or revised.max_tokens not in (None, item.max_tokens)
+                or (revised.end_after_commit and not item.end_after_commit)):
+            raise ValueError("attempt revision cannot grant another operation")
+        leader = revised.defer_while_loading
+        if leader is None:
+            return revised
+        request = scheduler.requests.get(leader)
+        load = scheduler._action_loads.get(leader)
+        pending = (request is not None and request.status.name == "WAITING_FOR_REMOTE_KVS"
+                   and leader not in scheduler.failed_recving_kv_req_ids
+                   and load is not None and load.result not in
+                   (ResultKind.FAILURE, ResultKind.ADOPTED, ResultKind.ENDED))
+        if pending:
+            from vllm.v1.kv_wait_trace import emit
+            emit("prefill_plan_restore_dependency", revised.request_id,
+                 leader=leader, step=scheduler.current_step, reason="native_reserved_not_published")
+            return None
+        return revised
+
+    def output_received(self, output):
+        self.pending_batches.pop(getattr(output, "_action_step_id", None), None)
 
     def report_path(self, scheduler, request, result, reason, *, match=None, quota=0):
         """Publish selection evidence without creating another resource owner."""
@@ -480,6 +569,12 @@ class PlanRuntime(CandidateReader):
                      scope="native attempt including nested checks; not additive to scheduler time")
 
     def final_stats(self, output):
+        if output.num_scheduled_tokens:
+            shape = tuple((rid, *self.current_grants[rid]) for rid in output.num_scheduled_tokens
+                          if rid in self.current_grants)
+            if len(shape) == len(output.num_scheduled_tokens):
+                self.pending_batches[self.snapshot.step_id] = SubmittedBatch(
+                    self.snapshot.step_id, shape, monotonic_ns())
         self.worker_initialized.update(r.req_id for r in output.scheduled_new_reqs)
         self.worker_initialized.difference_update(output.finished_req_ids)
         self.timings[-1].update(checked_requests=len(self.checked), actual_checks=self.check_count,

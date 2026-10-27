@@ -2465,6 +2465,9 @@ class Scheduler(SchedulerInterface):
                 if request in preempted_reqs:
                     continue
                 if explicit_plan:
+                    entry = plan_runtime.prepare_attempt(self, entry)
+                    if entry is None:
+                        continue
                     plan_runtime.active_item = entry
                     initial = plan_runtime.request_views[rid]
                     if entry.recovery_path is not None:
@@ -3213,6 +3216,9 @@ class Scheduler(SchedulerInterface):
         selection = getattr(self, "_native_compute_selection", None)
         if selection is not None:
             selection.output_received(scheduler_output)
+        plan_runtime = getattr(self, "_global_plan", None)
+        if plan_runtime is not None:
+            plan_runtime.output_received(scheduler_output)
         action_step = getattr(scheduler_output, "_action_step_id", None)
         action_results = {}
         if action_step is not None:

@@ -18,6 +18,8 @@ from vllm.v1.core.sched.compute_slo import (
     PlanningRequest,
 )
 from vllm.v1.core.sched.global_plan import CandidateReader, MatchObservation
+from vllm.v1.core.sched.prefill_estimate import RemainingEstimate as RemainingEstimate
+from vllm.v1.core.sched.prefill_estimate import remaining_estimate
 from vllm.v1.kv_wait_trace import emit
 
 
@@ -53,17 +55,6 @@ class ComputeKey:
 class ComputeGrant:
     tokens: int
     end_after_commit: bool = False
-
-
-@dataclass(frozen=True)
-class RemainingEstimate:
-    prefix_tokens: int
-    remaining_tokens: int
-    work: int
-    source: str
-    observed_ns: int
-    inflight_tokens: int
-    restore_reserved: bool
 
 
 class NativeComputeSelection:
@@ -278,25 +269,9 @@ class NativeComputeSelection:
         requests use the most recent *already observed* complete match; this
         scalar may be stale and is rechecked by the native takeover path.
         """
-        if request.held_hbm_blocks or request.accounted_tokens:
-            prefix = min(request.input_tokens, request.accounted_tokens)
-            source, observed = "native_accounted_unsubmitted", self.snapshot.observed_ns
-        elif request.last_match is not None:
-            prefix = request.last_match.matched_tokens
-            source, observed = "last_observed_match", request.last_match.observed_ns
-        else:
-            key = self.keys[request.request_id]
-            prefix = key.prefix_tokens
-            source, observed = "first_observed_match", key.frozen_ns
-        remaining = request.input_tokens - prefix
-        return RemainingEstimate(
-            prefix,
-            remaining,
-            self.model.estimate(remaining, prefix),
-            source,
-            observed,
-            request.inflight_tokens,
-            request.restore_reserved,
+        return remaining_estimate(
+            request, self.model, self.snapshot.observed_ns,
+            self.keys.get(request.request_id),
         )
 
     def plan_slo(self):
