@@ -185,6 +185,12 @@ class Scheduler(SchedulerInterface):
 
         num_gpu_blocks = self.cache_config.num_gpu_blocks
         assert num_gpu_blocks is not None and num_gpu_blocks > 0
+        wait_emit(
+            "hardware_cache_capacity",
+            num_gpu_blocks=num_gpu_blocks,
+            block_size=self.cache_config.block_size,
+            gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
+        )
 
         self.block_size = block_size
         self.dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
